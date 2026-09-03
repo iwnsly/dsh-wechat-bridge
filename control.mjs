@@ -532,7 +532,7 @@ function resolveSession() {
 // ---- 微信命令 ----
 // 「切换对话」（语音识别可能带标点或旧叫法，做兼容匹配）
 const SWITCH_CMD = '切换对话';
-const SWITCH_ALIASES = ['切换会话', '切换到对话', '切换到会话'];
+const SWITCH_ALIASES = ['切换', '切换会话', '切换到对话', '切换到会话'];
 const NEW_CMD = '新对话';
 const NEW_ALIASES = ['新建对话', '新开会话', '新开对话'];
 const STATUS_CMD = '状态';
@@ -707,7 +707,7 @@ async function handleSwitchCmd(peerId) {
 function handleHelpCmd() {
   return [
     '📋 可用指令：',
-    '🔀 切换对话｜切换会话 — 列出对话，发编号切换',
+    '🔀 切换｜切换对话 — 列出对话，发编号切换',
     '➕ 新对话｜新建对话 — 新建会话',
     '📊 状态｜当前状态 — 当前绑定会话状态',
     '📄 发文件 <文件名/路径> — 发送本地文件到微信',
