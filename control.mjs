@@ -376,6 +376,7 @@ async function sendTextWithRetry(peerId, contextToken, text, tries = 2) {
         sendText(peerId, contextToken, text),
         sleep(15_000).then(() => { throw new Error('发送超时'); }),
       ]);
+      rateLimitStreak = 0; // 任一发送成功说明当前通道已恢复，失败计数不应跨成功累计
       return true;
     } catch (e) {
       lastErr = e;
@@ -397,12 +398,14 @@ function enqueuePendingReply(peerId, text) {
   if (arr.includes(text)) return; // 去重
   if (arr.length >= 10) arr.shift(); // 上限
   arr.push(text);
+  saveState(); // 失败发生后立即持久化，进程重启也不丢待补发文本
   log(`待补发入队 [${peerId}]: ${text.slice(0, 30)}${text.length > 30 ? '…' : ''}`);
 }
 async function flushPendingReplies(peerId, contextToken) {
   const arr = pendingReplies.get(peerId);
-  if (!arr || !arr.length || !contextToken) return;
+  if (!arr || !arr.length || !peerId) return;
   const last = arr[arr.length - 1]; // 只补发最后一条（最新/最终结果），不刷屏
+  // context_token 可为空：sendText 内部会自动尝试无 token 发送，适合定时任务场景。
   pendingReplies.delete(peerId); // 清空积压
   try {
     await sendTextWithRetry(peerId, contextToken, `（补发）${last}`);
@@ -1116,6 +1119,7 @@ async function handleMessage(msg) {
     lastActivePeer = peerId;
     saveState();
     rateLimitUntil = 0; // 收到微信消息 = 会话重新激活，立即解除发送冷却（无需等 3 分钟）
+    rateLimitStreak = 0; // 新消息提供了新的会话上下文，清除旧失败计数
     await flushPendingReplies(peerId, contextToken); // 凭证已刷新：补发之前发送失败的回复
   }
 
@@ -1381,7 +1385,7 @@ async function watchForeignReplies() {
         const txt = extractText(event.data?.message?.content);
         if (txt && txt !== st.lastText) {
           st.lastText = txt; // 始终记录最新文本（节流跳过时也更新）
-          // 推送节流：距上次推送 <60s 则跳过（避免高频触发 iLink 风控）；
+          // 推送节流：距上次推送 <30s 则跳过（避免高频触发 iLink 风控）；
           // turn/end 时会把最新未推文本补推（最终必达），故中间被节流的不会丢最终。
           const throttled = st.lastPushAt !== 0 && Date.now() - st.lastPushAt < PUSH_THROTTLE_MS;
           if (!throttled && txt !== st.lastSent) {
@@ -1434,8 +1438,8 @@ async function watchForeignReplies() {
   }
 }
 
-// 同步推送一条文本到微信；返回 true=发送成功（游标可推进），false=失败/冷却中（下轮重试）。
-// 失败后 30 秒内不再重试，日志最多每 30 秒一次，避免刷屏。
+// 同步推送一条文本到微信；返回 true=发送成功，false=失败/冷却中（游标继续推进，文本入待补发）。
+// 失败后重试冷却为 5 分钟，日志同步节流，避免持续向 iLink 打失败请求。
 // 失败后重试冷却：曾用 30 秒，但高频失败重试会向 iLink 持续打请求（曾累计 239 次失败），
 // 反而加重发送风控（prepare failed）并刷屏日志。改为 5 分钟一次低频重试，帮助风控恢复；
 // 不丢消息：失败文本已入待补发队列，凭证/风控恢复后自动补发。
@@ -1444,18 +1448,21 @@ const SYNC_RETRY_MS = 5 * 60 * 1000;
 // turn/end 时最新未推文本会补推（最终必达），中间被节流的不会丢最终。
 const PUSH_THROTTLE_MS = 30_000;
 async function syncPush(text, st) {
-  if (st.lastFailAt && Date.now() - st.lastFailAt < SYNC_RETRY_MS) return false; // 冷却中
+  if (st.lastFailAt && Date.now() - st.lastFailAt < SYNC_RETRY_MS) {
+    enqueuePendingReply(lastActivePeer, text); // 冷却期间也不能丢消息；只是不发请求
+    return false;
+  } // 冷却中
   const peerId = lastActivePeer;
-  const ctx = peerId ? peerTokens.get(peerId) : null;
-  if (!peerId || !ctx) {
-    // 尚无发送凭证：等用户发一条微信消息后自动就绪（凭证已持久化，重启不丢）
+  const ctx = peerId ? peerTokens.get(peerId) ?? null : null;
+  if (!peerId) {
     if (!st.lastLoggedAt || Date.now() - st.lastLoggedAt >= SYNC_RETRY_MS)
-      log('同步推送待发送：尚无微信发送凭证（请先在微信发一条消息）:', text.slice(0, 30));
+      log('同步推送待发送：尚无微信联系人（请先收到一条微信消息）:', text.slice(0, 30));
     st.lastLoggedAt = Date.now();
     st.lastFailAt = Date.now();
     return false;
   }
   try {
+    // context_token 可为空：sendText 会自动尝试无 token 发送，适合网页端/定时推送。
     await sendTextWithRetry(peerId, ctx, text);
     st.lastFailAt = 0;
     st.lastLoggedAt = 0;
@@ -1610,11 +1617,12 @@ const server = http.createServer(async (req, res) => {
     const text = String(body.text ?? body.message ?? '').trim();
     const peerId = body.peerId || lastActivePeer;
     if (!text) return json(res, 200, { ok: false, error: '缺少 text 字段' });
-    if (!peerId || !peerTokens.get(peerId)) {
-      return json(res, 200, { ok: false, error: '尚无微信发送凭证（请先在微信发一条消息）' });
+    if (!peerId) {
+      return json(res, 200, { ok: false, error: '没有可用的微信联系人（请先收到一条微信消息）' });
     }
     try {
-      await sendTextWithRetry(peerId, peerTokens.get(peerId), text, 2);
+      // context_token 可选：有缓存时优先携带，失效后由 sendText fallback 为无 token 发送。
+      await sendTextWithRetry(peerId, peerTokens.get(peerId) ?? null, text, 2);
       log(`API 主动发送 [${peerId}]: ${text.slice(0, 40)}${text.length > 40 ? '…' : ''}`);
       return json(res, 200, { ok: true, sent: text });
     } catch (e) {
@@ -1632,8 +1640,8 @@ const server = http.createServer(async (req, res) => {
     const filePath = String(body.path ?? body.file ?? '').trim();
     const peerId = body.peerId || lastActivePeer;
     if (!filePath) return json(res, 200, { ok: false, error: '缺少 path 字段' });
-    if (!peerId || !peerTokens.get(peerId)) {
-      return json(res, 200, { ok: false, error: '尚无微信发送凭证（请先在微信发一条消息）' });
+    if (!peerId) {
+      return json(res, 200, { ok: false, error: '没有可用的微信联系人（请先收到一条微信消息）' });
     }
     try {
       const fp = await resolveFileToSend(filePath);
