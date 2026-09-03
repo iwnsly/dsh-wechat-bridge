@@ -147,4 +147,30 @@ node wechat-bot.mjs     # 独立的扫码/监听 Bot
 
 - DSH 的 `/api` 只监听回环地址、无鉴权，control.mjs 必须与 DSH **同机运行**；配置网页默认只监听 `127.0.0.1`，勿暴露公网。
 - 微信与网页同时发消息时按 `queue` 模式排队依次处理。
+
+## 开发与维护（Git）
+
+仓库：`https://github.com/iwnsly/dsh-wechat-bridge`
+
+**敏感文件保护**（已写入 `.gitignore`，勿强行 `git add -f` 提交）：
+
+| 文件 | 内容 | 是否入库 |
+| --- | --- | --- |
+| `config.json` | 微信 botToken 登录态 | ❌ 排除 |
+| `state.json` | 微信 context_token 发送凭证 | ❌ 排除 |
+| `logs/` | 运行时日志 | ❌ 排除 |
+| `config.example.json` | 配置示例（占位符） | ✅ 提交 |
+
+**日常更新流程**（改完代码 → 推送）：
+
+```bash
+cd /Users/macbot/Documents/dp-remote/wechat-bridge
+git add -A            # 或 git add <具体文件>
+git commit -m "feat: 说明本次改动"
+git push              # 推送 origin/main
+```
+
+- 改动涉及运行中进程时，先 `node --check control.mjs` 再按部署纪律重启（见「部署与自启」）。
+- 新增运行时依赖若改动了 `package.json`，记得一并提交。
+- 用 `gh auth login` 或系统钥匙串免密推送；也可改用 SSH：`git remote set-url origin git@github.com:iwnsly/dsh-wechat-bridge.git`。
 - 每次扫码 Bot ID 会变，属 iLink 平台正常现象；登录态存 `config.json`（600），重启免扫码。
