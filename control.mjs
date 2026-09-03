@@ -1356,9 +1356,9 @@ async function watchForeignReplies() {
 // 反而加重发送风控（prepare failed）并刷屏日志。改为 5 分钟一次低频重试，帮助风控恢复；
 // 不丢消息：失败文本已入待补发队列，凭证/风控恢复后自动补发。
 const SYNC_RETRY_MS = 5 * 60 * 1000;
-// 同步推送节流：网页端任务阶段回复每 60 秒最多推 1 条（避免高频触发 iLink 风控）；
+// 同步推送节流：网页端任务阶段回复每 15 秒最多推 1 条（避免高频触发 iLink 风控，节奏更及时）；
 // turn/end 时最新未推文本会补推（最终必达），中间被节流的不会丢最终。
-const PUSH_THROTTLE_MS = 60_000;
+const PUSH_THROTTLE_MS = 15_000;
 async function syncPush(text, st) {
   if (st.lastFailAt && Date.now() - st.lastFailAt < SYNC_RETRY_MS) return false; // 冷却中
   const peerId = lastActivePeer;
