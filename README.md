@@ -29,7 +29,8 @@ wechat-bridge/
 ├── wechat-bot.mjs      [备用] 独立微信 Bot（默认对接 dsh-bridge.mjs）
 ├── package.json        npm start = node control.mjs
 ├── config.json         DSH 地址 + 微信登录态(botToken) + 默认会话（权限 600，重启免扫码）
-├── state.json          微信发送凭证(context_token) 持久化：桥接重启后同步推送不中断
+├── config.example.json 配置示例（占位符，可提交；config.json 已被 .gitignore 排除）
+├── state.json          发送凭证(context_token)+待补发队列(pendingReplies) 持久化：重启不中断/不丢
 ├── logs/
 │   ├── control.out.log 运行日志（消息/阶段回复/同步推送全链路可查）
 │   └── control.err.log 异常输出
@@ -81,7 +82,8 @@ npm start                 # 等价 node control.mjs
 - **30 秒状态**：距上次发到微信的消息超过 30 秒才发「⏳ 正在处理中…（已等待 N 秒）」，N = 从发消息起的**总等待时间**；每发一条消息都重新计时，有回复在回就不刷状态。
 - **取消执行**：执行中发「取消/停/停止/算了」→ `session.cancel` 中断当前生成并回执。
 - **错误与停止兜底**：DSH 端报错/中断（error/aborted/interrupted）把原因发回微信；轮询连续失败且持续 ≥4 秒判定 DSH 失联，立即停止轮询并发送「DSH 服务似乎已停止或报错」。
-- **绑定会话回复同步**：默认会话里由 **DSH 网页端发起**的对话，每步回复（含最终结果、出错/中断提示）也同步推送到微信；与微信任务共用会话级游标，**每条只发一次**；凭证持久化（`state.json`），重启不丢。推送到最近联系过的微信用户。
+- **绑定会话回复同步**：默认会话里由 **DSH 网页端发起**的对话，每步回复（含最终结果、出错/中断提示）也同步推送到微信；与微信任务共用会话级游标，**每条只发一次**；推送节流（阶段回复约 30 秒一条）+ turn/end **最终必达**；凭证与待补发持久化（`state.json`），重启不丢。
+- **切换即续听**：用「切换」/「切换对话」切到目标会话后，若它在 DSH 有**正在执行的任务**，从切换时刻起产生的回复会**持续推送直至任务结束**（不回放切换前旧内容）。
 - **语音消息**：优先用平台自带转写文本（`voice_item.text`）当文字对话；无转写时明确提示。
 - **媒体保存**：图片/文件/视频自动下载 + AES 解密，存到默认会话工作区 `wechat-media/<YYYYMMDD>/`，回发保存路径；之后可用文字让机器人继续处理。
 - **优雅停机**：收到停止信号时，在途任务先把「⚠️ 服务正在升级重启，本条任务已被中断」发回微信再退出——部署重启不再静默丢回复。
@@ -97,7 +99,7 @@ npm start                 # 等价 node control.mjs
 
 数据文件：
 - `config.json`：DSH 地址、微信登录态（`botToken`，权限 600）、`defaultSessionId` 默认会话。
-- `state.json`：微信发送凭证（`peerTokens` / `lastActivePeer`），桥接重启后同步推送仍可用。
+- `state.json`：微信发送凭证（`peerTokens` / `lastActivePeer`）与**待补发队列**（`pendingReplies`，按会话隔离），桥接重启后同步推送仍可用、失败文本不丢。
 
 ## 管理接口
 
@@ -170,7 +172,7 @@ launchctl print gui/$(id -u)/com.macbot.dsh-wechat-bridge          # 查看任�
 | 现象 | 处理 |
 |---|---|
 | 微信收到阶段消息但**没有最终回复** | 查日志最后一行是否为「已回复/本轮无最终回复」；多为部署重启打断——优雅停机下你会收到「任务被中断」通知，重发即可 |
-| 日志：「同步推送待发送：尚无微信发送凭证」 | 在微信发一条消息即可（凭证会持久化） |
+| 日志：「同步推送待发送：尚无微信联系人」 | 重启后还没收到过微信消息、无可用联系人；在微信发一条消息即可（联系人/凭证会持久化） |
 | 日志：「DSH 服务似乎已停止或报错」 | 检查 127.0.0.1:3080 的 DSH web 是否在跑 |
 | 日志：「微信登录过期，已自动解绑」 | 重新扫码绑定（iLink 平台正常现象） |
 | 收不到任何消息 / 服务疑似崩溃 | 看 `logs/control.err.log`；`launchctl print gui/$(id -u)/com.macbot.dsh-wechat-bridge` |
