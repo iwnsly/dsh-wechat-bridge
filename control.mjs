@@ -1149,6 +1149,53 @@ async function handleMediaMessage(peerId, contextToken, msg, first) {
   }
 }
 
+// 取会话历史中最后一条非空回复文本（assistant/message）
+async function lastSessionMessage(sessionId) {
+  try {
+    const { events } = await dshRpc('session.history', { sessionId, maxMessages: 20 });
+    let last = '';
+    for (const { event } of events ?? []) {
+      if (event?.type === 'assistant/message') {
+        const txt = extractText(event.data?.message?.content);
+        if (txt) last = txt;
+      }
+    }
+    return last;
+  } catch { return ''; }
+}
+
+// 空白/空格消息 = "建立连接"：补发积压（handleMessage 顶部已 flush）+
+// 空闲会话回发最后一条记录消息；进行中会话回当前任务状态。
+async function handleBlankConnection(peerId, contextToken) {
+  const sessionId = resolveSession();
+  log(`微信建立连接（空白消息）[${peerId}] 会话=${sessionId?.slice(0, 12) ?? '-'}`);
+  if (!sessionId) {
+    try { await sendText(peerId, contextToken, '（还没有配置默认会话，请先发「切换对话」选择。）'); } catch {}
+    return;
+  }
+  let info = null;
+  try { info = await sessionBusyInfo(sessionId); } catch {}
+  const sessions = await buildSwitchList().catch(() => []);
+  const cur = sessions.find((s) => s.sessionId === sessionId);
+  const name = (cur?.title && cur.title.trim()) ? cur.title : sessionId;
+  try {
+    if (info && info.busy) {
+      // 有进行中的任务：回当前状态
+      const lines = [`🔗 连接已建立。对话「${name}」正在执行任务：`];
+      if (info.lastMessage) lines.push(`📝 最新阶段回复：\n${info.lastMessage.slice(0, 300)}`);
+      if (info.lastCommand) lines.push(`🔧 正在执行的命令：\n${info.lastCommand.slice(0, 200)}`);
+      await sendTextWithRetry(peerId, contextToken, lines.join('\n'));
+    } else {
+      // 空闲：回发最后一条记录消息
+      const last = await lastSessionMessage(sessionId);
+      if (last) await sendTextWithRetry(peerId, contextToken, `🔗 连接已建立。对话「${name}」最近一条记录：\n${last.slice(0, 500)}`);
+      else await sendTextWithRetry(peerId, contextToken, `🔗 连接已建立。对话「${name}」暂无记录消息。`);
+    }
+  } catch (e) {
+    log('建立连接回复失败:', e.message);
+  }
+}
+
 async function handleMessage(msg) {
   // message_type: 1=用户消息 2=机器人消息（proto MessageType）
   if (msg.message_type !== 1) return;
@@ -1180,6 +1227,11 @@ async function handleMessage(msg) {
     lastMessageAt = Date.now();
     handledCount++;
     if (await handleMediaMessage(peerId, contextToken, msg, first)) return;
+    // 纯文本的空白/空格消息：当作"建立连接"——补发积压 + 空闲回发最后一条记录（不进 DSH 对话）
+    if (first.type === 1) {
+      await handleBlankConnection(peerId, contextToken);
+      return;
+    }
     log(`收到无法转写的消息 [${peerId}]: item_type=${first.type} keys=${Object.keys(first).join(',')}`);
     try {
       await sendText(peerId, contextToken, '（收到无法解析的消息类型；支持：文字、带平台转写的语音，以及图片/文件/视频的自动保存。）');
