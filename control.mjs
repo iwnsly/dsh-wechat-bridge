@@ -102,14 +102,20 @@ async function listSessions() {
   // 与 DSH 网页完全一致的可见规则：
   // 1. 已归档（删除/隐藏）的会话不显示
   // 2. 空白会话（无任何对话内容）不显示、不可选
+  // 3. 子任务会话（parentSessionId 非空）不显示——它们是某会话派生的子任务，不出现在工作区/界面
+  // 4. 只显示归属于某个工作区（workspace.sessionIds）的会话，与界面左侧列表一致
   let archived = new Set();
+  let inWorkspace = new Set();
   try {
     const wl = await dshRpc('workspace.list', {}, 15_000);
     archived = new Set(wl.archivedSessionIds ?? []);
+    for (const w of wl.items ?? []) for (const sid of w.sessionIds ?? []) inWorkspace.add(sid);
   } catch {}
   return items
     .filter((s) => !archived.has(s.sessionId))
     .filter((s) => !s.blank)
+    .filter((s) => !s.parentSessionId)
+    .filter((s) => inWorkspace.has(s.sessionId))
     .map((s) => ({
     sessionId: s.sessionId,
     title: s.projections?.values?.title ?? null,
