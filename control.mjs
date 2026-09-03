@@ -1348,7 +1348,10 @@ async function watchForeignReplies() {
 
 // 同步推送一条文本到微信；返回 true=发送成功（游标可推进），false=失败/冷却中（下轮重试）。
 // 失败后 30 秒内不再重试，日志最多每 30 秒一次，避免刷屏。
-const SYNC_RETRY_MS = 30_000;
+// 失败后重试冷却：曾用 30 秒，但高频失败重试会向 iLink 持续打请求（曾累计 239 次失败），
+// 反而加重发送风控（prepare failed）并刷屏日志。改为 5 分钟一次低频重试，帮助风控恢复；
+// 不丢消息：失败文本已入待补发队列，凭证/风控恢复后自动补发。
+const SYNC_RETRY_MS = 5 * 60 * 1000;
 async function syncPush(text, st) {
   if (st.lastFailAt && Date.now() - st.lastFailAt < SYNC_RETRY_MS) return false; // 冷却中
   const peerId = lastActivePeer;
