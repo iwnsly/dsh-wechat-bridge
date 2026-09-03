@@ -1513,6 +1513,29 @@ const server = http.createServer(async (req, res) => {
     }
   }
 
+  // POST /api/send-file  { path: '文件路径或文件名', peerId?: 'o9cq...' }
+  // 主动把本地文件/图片发到微信（外部系统触发）；path 支持工作目录搜索（同「发文件」指令）。
+  // 凭证过期时会直接返回错误（文件不进待补发队列），需用户发条微信消息刷新凭证后重试。
+  if (req.method === 'POST' && pathname === '/api/send-file') {
+    let body = {};
+    try { body = await readJson(req); } catch {}
+    const filePath = String(body.path ?? body.file ?? '').trim();
+    const peerId = body.peerId || lastActivePeer;
+    if (!filePath) return json(res, 200, { ok: false, error: '缺少 path 字段' });
+    if (!peerId || !peerTokens.get(peerId)) {
+      return json(res, 200, { ok: false, error: '尚无微信发送凭证（请先在微信发一条消息）' });
+    }
+    try {
+      const fp = await resolveFileToSend(filePath);
+      if (!fp) return json(res, 200, { ok: false, error: `未找到文件「${filePath}」（可用完整路径或工作目录内文件名）` });
+      await sendMediaFile(peerId, peerTokens.get(peerId), fp);
+      log(`API 发送文件 [${peerId}]: ${fp}`);
+      return json(res, 200, { ok: true, sent: fp });
+    } catch (e) {
+      return json(res, 200, { ok: false, error: e.message });
+    }
+  }
+
   return json(res, 404, { error: 'not found' });
 });
 

@@ -105,6 +105,7 @@ npm start                 # 等价 node control.mjs
 | `POST /api/bind` / `POST /api/unbind` | 微信绑定 / 解绑 |
 | `GET /api/logs` | 最近日志（网页「最近日志」面板） |
 | `POST /api/send` | 主动给微信发文本消息（外部系统/定时任务触发） |
+| `POST /api/send-file` | 主动把本地文件/图片发到微信（外部系统/定时任务触发） |
 
 ### `/api/send` 主动发送接口
 
@@ -120,6 +121,20 @@ curl -X POST http://127.0.0.1:3083/api/send \
 - 返回成功：`{"ok":true,"sent":"..."}`；失败：`{"ok":false,"error":"...","enqueued":true}`
 - **凭证时效限制**：发送凭证 `context_token` 有效期约 90–160 秒，且仅在有新微信消息时刷新。若长时间没有微信消息往来，主动发送会失败并返回 `enqueued:true`（进入待补发队列），你下次在微信发一条消息后会自动补发。
 - 接口仅监听 `127.0.0.1`，外部程序需同机访问；暴露公网时请自行加代理/鉴权。
+
+### `/api/send-file` 主动发送文件接口
+
+把本地文件/图片推送到微信（图片以图片形式，其余以文件形式）。
+
+```bash
+curl -X POST http://127.0.0.1:3083/api/send-file \
+  -H 'Content-Type: application/json' \
+  -d '{"path":"每日分析.csv"}'
+```
+
+- 参数：`path`（必填，完整路径或工作目录内文件名，支持目录搜索）；`peerId`（可选，默认最近联系人）
+- 返回成功：`{"ok":true,"sent":"<绝对路径>"}`；失败：`{"ok":false,"error":"..."}`
+- 限制：单文件 ≤ 20MB；凭证过期时直接返回错误（文件不进待补发队列），需先在微信发一条消息刷新凭证后重试。
 
 ## 部署与自启（launchd）
 
