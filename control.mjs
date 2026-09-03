@@ -253,6 +253,7 @@ async function promptAndCollect(sessionId, text, isCancelled, onStage, delivered
                 await onStage(txt);
                 deliveredText = txt; // 发送成功才推进；失败则最终回复会补发这段内容，不丢失
                 noteAssistantText(sessionId, txt); // 检测"编号选项提问"→记录待回答状态
+                maybeNotifyConfirm(sessionId); // 权限/确认类请求 → 微信推「是/否」提示
               } catch { /* 阶段发送失败：留待最终回复兜底 */ }
             }
           }
@@ -503,8 +504,10 @@ const HELP_ALIASES = ['帮助', '菜单', 'help', 'Help', '指令列表', '有�
 // 记住待回答状态；微信回复序号时，把对应选项内容作为新消息注入 DSH 会话（queue），
 // agent 在下一轮据此继续。
 const INTERACT_FRESH_MS = 10 * 60 * 1000; // 待回答提问的有效期
-const pendingInteraction = new Map(); // sessionId -> { options:[], question, at }
+const pendingInteraction = new Map(); // sessionId -> { type:'options'|'yesno', options?, question, at }
 const INTERACT_HINT = /请选择|请回复|回复[序号数字]|回复\s*[0-9一二两三四五六七八九十]|你选|你希望|想让你|需要你选择|选一个|麻烦选|哪个(方案|选项)|告诉我选/;
+// 权限/确认类请求：agent 需要用户"是/否"拍板（DSH 无权限批准 API，采用文本注入告知用户决策）
+const PERM_HINT = /需要(你)?(的)?(权限|授权|批准)|请求(你)?(的)?(权限|授权)|需要更高权限|是否(允许|继续|执行|同意|可以|删除|需要|完成)|请(授权|批准|确认)|permission/i;
 // 从文本解析编号选项列表（1. xxx / 1、xxx / 1) xxx），不足 2 项返回 null
 function parseOptions(text) {
   if (!text) return null;
@@ -520,12 +523,30 @@ function parseOptions(text) {
   }
   return opts.length >= 2 ? opts : null;
 }
-// 记录/作废"待回答提问"：agent 每产生一条新回复都调用
+// 记录/作废"待回答提问"：agent 每产生一条新回复都调用。
+// 类型：'options'=编号选项选择；'yesno'=权限/确认类（是/否）。
 function noteAssistantText(sessionId, text) {
   if (!text) return;
   const options = INTERACT_HINT.test(text) ? parseOptions(text) : null;
-  if (options) pendingInteraction.set(sessionId, { options, question: text.slice(0, 200), at: Date.now() });
-  else pendingInteraction.delete(sessionId); // 有新实质回复，旧的待回答提问作废
+  if (options) {
+    pendingInteraction.set(sessionId, { type: 'options', options, question: text.slice(0, 200), at: Date.now() });
+    return;
+  }
+  if (PERM_HINT.test(text)) {
+    pendingInteraction.set(sessionId, { type: 'yesno', question: text.slice(0, 200), at: Date.now() });
+    return;
+  }
+  pendingInteraction.delete(sessionId); // 有新实质回复，旧的待回答提问作废
+}
+// 若是/否确认待回答 → 微信推一条提示（不阻塞；同一条文本只触发一次）
+function maybeNotifyConfirm(sessionId) {
+  const peerId = lastActivePeer;
+  if (!peerId) return;
+  const pend = pendingInteraction.get(sessionId);
+  if (pend?.type !== 'yesno') return;
+  const ctx = peerTokens.get(peerId);
+  if (!ctx) return;
+  void sendTextWithRetry(peerId, ctx, '⚡ DSH 需要你的确认：回复「是」或「否」').catch(() => {});
 }
 const SWITCH_PENDING_TTL_MS = 2 * 60 * 1000;
 const switchPending = new Map(); // peerId -> { kind: 'session'|'workspace', expireAt, ... }
@@ -650,6 +671,7 @@ function handleHelpCmd() {
     '📄 发文件 <文件名/路径> — 发送本地文件到微信',
     '⏹ 取消｜停｜停止 — 中断当前任务',
     '🔢 编号（1/2/一/二）— 切换选择 / DSH 交互选择',
+    '⚡ 是/否 — 回复 DSH 的权限/确认请求',
     '❓ 指令｜帮助 — 显示本菜单',
     '直接发文字/语音 = 让 DSH 处理，回复自动同步到微信。',
   ].join('\n\n');
@@ -1155,6 +1177,44 @@ async function handleMessage(msg) {
     }
   }
 
+  // ---- DSH 权限/确认请求：微信回复「是/否」→ 注入用户决策给 DSH ----
+  if (boundSid) {
+    const pend = pendingInteraction.get(boundSid);
+    if (pend && pend.type === 'yesno' && Date.now() - pend.at < INTERACT_FRESH_MS) {
+      const k = stripPunct(t).toLowerCase();
+      const YES = ['是', '是的', '可以', '同意', 'ok', '好', '行', '确定', '允许', '批准', '对'];
+      const NO = ['否', '不', '不行', '不要', '拒绝', '不同意', '取消', 'no', '不对'];
+      if (YES.includes(k)) {
+        pendingInteraction.delete(boundSid);
+        log(`微信确认 [${peerId}]: 是`);
+        try {
+          await dshRpc('session.prompt', {
+            sessionId: boundSid, mode: 'queue', content: [{ type: 'text', text: '用户确认：是' }],
+          }, 15_000);
+          await sendTextWithRetry(peerId, contextToken, '✅ 已把你的确认「是」发送给 DSH。');
+        } catch (e) {
+          log('注入用户确认失败:', e.message);
+          await sendTextWithRetry(peerId, contextToken, '（把确认发送给 DSH 失败：' + (e.message ?? e) + '）');
+        }
+        return;
+      }
+      if (NO.includes(k)) {
+        pendingInteraction.delete(boundSid);
+        log(`微信确认 [${peerId}]: 否`);
+        try {
+          await dshRpc('session.prompt', {
+            sessionId: boundSid, mode: 'queue', content: [{ type: 'text', text: '用户确认：否' }],
+          }, 15_000);
+          await sendTextWithRetry(peerId, contextToken, '✅ 已把你的确认「否」发送给 DSH。');
+        } catch (e) {
+          log('注入用户确认失败:', e.message);
+          await sendTextWithRetry(peerId, contextToken, '（把确认发送给 DSH 失败：' + (e.message ?? e) + '）');
+        }
+        return;
+      }
+    }
+  }
+
   // ---- 微信命令：切换对话 / 新对话 / 编号选择（不触碰 DSH 代码）----
   let reply = null;
   if (isCmd(t, SWITCH_CMD, SWITCH_ALIASES)) {
@@ -1308,6 +1368,7 @@ async function watchForeignReplies() {
           }
           cursor = seq;
           noteAssistantText(sessionId, txt); // 检测"编号选项提问"→记录待回答状态
+          maybeNotifyConfirm(sessionId); // 权限/确认类请求 → 微信推「是/否」提示
           // 自动发送回复中提到的本地文件/图片（不阻塞文本推送）
           void sendReplyFiles(lastActivePeer, lastActivePeer ? peerTokens.get(lastActivePeer) : null, txt);
         }
