@@ -5,7 +5,7 @@ import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { randomUUID, createDecipheriv } from 'node:crypto';
+import { randomUUID, createDecipheriv, createCipheriv, createHash, randomBytes } from 'node:crypto';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const WX_BASE = 'https://ilinkai.weixin.qq.com';
@@ -56,6 +56,8 @@ let config = loadConfig();
 
 // ---------------- 微信发送凭证持久化（重启后仍可继续同步推送） ----------------
 const STATE_PATH = CONFIG_PATH.replace(/config\.json$/, 'state.json');
+// 待补发队列（发送失败暂存，凭证刷新后自动补发；持久化到 state.json 跨重启不丢）
+const pendingReplies = new Map(); // peerId -> string[]
 function loadState() {
   try { return JSON.parse(fs.readFileSync(STATE_PATH, 'utf8')) ?? {}; } catch { return {}; }
 }
@@ -65,6 +67,7 @@ function saveState() {
     fs.writeFileSync(tmp, JSON.stringify({
       peerTokens: Object.fromEntries(peerTokens),
       lastActivePeer,
+      pendingReplies: Object.fromEntries(pendingReplies),
     }, null, 2));
     fs.renameSync(tmp, STATE_PATH);
     try { fs.chmodSync(STATE_PATH, 0o600); } catch {}
@@ -156,6 +159,12 @@ const MAX_POLL_ERRORS = 3;
 const sessionRelay = new Map(); // sessionId -> { lastSeq, lastText }
 const engagedSessions = new Set();
 const prevState = loadState();
+// 恢复待补发队列（跨重启不丢；发送失败的回复在凭证刷新后自动补发）
+if (prevState?.pendingReplies && typeof prevState.pendingReplies === 'object') {
+  for (const [peer, arr] of Object.entries(prevState.pendingReplies)) {
+    if (Array.isArray(arr) && arr.length) pendingReplies.set(peer, arr.filter(Boolean));
+  }
+}
 const peerTokens = new Map(Object.entries(prevState.peerTokens ?? {})); // peerId -> context_token
 let lastActivePeer = prevState.lastActivePeer ?? null;                 // 最近发来消息的联系人
 
@@ -347,6 +356,34 @@ async function sendTextWithRetry(peerId, contextToken, text, tries = 2) {
     }
   }
   throw lastErr;
+}
+
+// 发送失败的回复先暂存，等用户下次发微信消息（刷新 context_token）后自动补发，
+// 解决"长任务期间凭证失效导致回复静默丢失"的问题（两次实锤过）。
+// 声明见顶部 state 区（持久化用）；此处仅定义操作函数。
+function enqueuePendingReply(peerId, text) {
+  if (!peerId || !text) return;
+  let arr = pendingReplies.get(peerId);
+  if (!arr) { arr = []; pendingReplies.set(peerId, arr); }
+  if (arr.includes(text)) return; // 去重
+  if (arr.length >= 10) arr.shift(); // 上限
+  arr.push(text);
+  log(`待补发入队 [${peerId}]: ${text.slice(0, 30)}${text.length > 30 ? '…' : ''}`);
+}
+async function flushPendingReplies(peerId, contextToken) {
+  const arr = pendingReplies.get(peerId);
+  if (!arr || !arr.length || !contextToken) return;
+  const items = arr.splice(0);
+  for (const t of items) {
+    try {
+      await sendTextWithRetry(peerId, contextToken, t, 2);
+      log(`补发成功 [${peerId}]: ${t.slice(0, 40)}${t.length > 40 ? '…' : ''}`);
+    } catch (e) {
+      pendingReplies.set(peerId, [t, ...(pendingReplies.get(peerId) ?? [])]); // 放回队首待下次
+      log('补发失败（保留待下次）:', e.message);
+      return;
+    }
+  }
 }
 
 // ---------------- 微信 iLink 客户端 ----------------
@@ -706,7 +743,7 @@ const ITEM_VOICE = 3;
 
 async function sendText(peerId, contextToken, text) {
   const clientId = `openclaw-weixin-${Math.floor(Math.random() * 0xFFFFFFFF).toString(16).padStart(8, '0')}`;
-  await wxPost('ilink/bot/sendmessage', {
+  const resp = await wxPost('ilink/bot/sendmessage', {
     msg: {
       from_user_id: '',
       to_user_id: peerId,
@@ -718,6 +755,14 @@ async function sendText(peerId, contextToken, text) {
     },
     base_info: { channel_version: '1.0.2' },
   }, token);
+  // 校验 iLink 返回码：失败时可能是 errcode 也可能是 ret（实测 sendmessage 失败返回 {ret:-2}）。
+  // 此前只查 errcode 会把 ret 失败误判为成功 → 微信端静默丢失（两次实锤）。
+  const code = resp && (resp.errcode ?? resp.ret);
+  if (typeof code === 'number' && code !== 0) {
+    const msg = `iLink sendmessage ret=${code} ${resp?.errmsg ?? ''}`.trim();
+    log(msg);
+    throw new Error(msg);
+  }
 }
 
 // ---- 媒体（图片/文件/视频）接收并保存到当前工作区 ----
@@ -736,6 +781,168 @@ function parseAesKey(aesKeyBase64) {
 function decryptAesEcb(ciphertext, key) {
   const decipher = createDecipheriv('aes-128-ecb', key, null);
   return Buffer.concat([decipher.update(ciphertext), decipher.final()]);
+}
+
+// ---------------- 发送文件/图片到微信（iLink 媒体上传+发送）----------------
+// 链路：AES-128-ECB 加密文件 → getuploadurl 申请上传凭证 → 加密内容上传到微信 CDN →
+//       sendmessage 携带媒体项（图片 type:2 / 文件 type:4）。
+// 参考 weixinProxy（AndySkaura/weixinProxy，iLink 协议）的发送实现。
+const CDN_BASE = 'https://novac2c.cdn.weixin.qq.com/c2c';
+const MEDIA_SEND_IMAGES = new Set(['.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp']);
+const MEDIA_SEND_DOCS = new Set(['.csv', '.xlsx', '.xls', '.txt', '.md', '.pdf', '.json', '.zip', '.yaml', '.yml', '.html', '.htm', '.xml']);
+const MAX_MEDIA_BYTES = 20 * 1024 * 1024; // 单个文件上限 20MB
+
+function encryptAesEcb(plaintext, key) {
+  const cipher = createCipheriv('aes-128-ecb', key, null);
+  return Buffer.concat([cipher.update(plaintext), cipher.final()]);
+}
+function md5Hex(buf) { return createHash('md5').update(buf).digest('hex'); }
+function encodeOutboundAesKey(key) { return Buffer.from(key.toString('hex'), 'utf8').toString('base64'); }
+
+// 发送一个本地文件/图片到微信；成功返回 true，失败抛错（调用方决定是否吞掉）
+async function sendMediaFile(peerId, contextToken, filePath) {
+  const stat = fs.statSync(filePath);
+  if (!stat.isFile() || stat.size <= 0) throw new Error(`不是有效文件: ${filePath}`);
+  if (stat.size > MAX_MEDIA_BYTES) throw new Error(`文件过大(${Math.round(stat.size / 1024 / 1024)}MB>20MB): ${filePath}`);
+  const plaintext = fs.readFileSync(filePath);
+  const ext = path.extname(filePath).toLowerCase();
+  const kind = MEDIA_SEND_IMAGES.has(ext) ? 'image' : 'file';
+  const mediaType = kind === 'image' ? 1 : 3; // 上传类型：image=1 file=3
+  const aesKey = randomBytes(16);
+  const ciphertext = encryptAesEcb(plaintext, aesKey);
+  const filekey = randomBytes(16).toString('hex');
+  const resp = await wxPost('ilink/bot/getuploadurl', {
+    filekey,
+    media_type: mediaType,
+    to_user_id: peerId,
+    rawsize: plaintext.length,
+    rawfilemd5: md5Hex(plaintext),
+    filesize: ciphertext.length,
+    no_need_thumb: true,
+    aeskey: aesKey.toString('hex'),
+    base_info: { channel_version: '1.0.2' },
+  }, token);
+  const r = Number(resp?.ret ?? 0); // 成功时响应通常无 ret 字段（只有 upload_param），缺失视为 0
+  if (r !== 0 || (!resp.upload_param && !resp.upload_full_url)) {
+    throw new Error(`getuploadurl ret=${resp?.ret} ${resp?.errmsg ?? ''}`.trim());
+  }
+  const upUrl = resp.upload_full_url
+    || `${CDN_BASE}/upload?encrypted_query_param=${encodeURIComponent(resp.upload_param)}&filekey=${filekey}`;
+  const upRes = await fetch(upUrl, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/octet-stream' },
+    body: ciphertext,
+    signal: AbortSignal.timeout(30_000),
+  });
+  if (!upRes.ok) throw new Error(`CDN 上传失败: HTTP ${upRes.status}`);
+  const encryptedParam = upRes.headers.get('x-encrypted-param');
+  if (!encryptedParam) throw new Error('CDN 上传未返回 x-encrypted-param');
+  const media = { encrypt_query_param: encryptedParam, aes_key: encodeOutboundAesKey(aesKey), encrypt_type: 1 };
+  let item;
+  if (kind === 'image') {
+    item = { type: 2, image_item: { media, aeskey: aesKey.toString('hex'), mid_size: ciphertext.length, hd_size: ciphertext.length } };
+  } else {
+    item = { type: 4, file_item: { media, file_name: path.basename(filePath), md5: md5Hex(plaintext), len: String(plaintext.length) } };
+  }
+  const clientId = `openclaw-weixin-${Math.floor(Math.random() * 0xFFFFFFFF).toString(16).padStart(8, '0')}`;
+  const sendResp = await wxPost('ilink/bot/sendmessage', {
+    msg: {
+      from_user_id: '', to_user_id: peerId, client_id: clientId,
+      message_type: 2, message_state: 2, context_token: contextToken,
+      item_list: [item],
+    },
+    base_info: { channel_version: '1.0.2' },
+  }, token);
+  const code = sendResp && (sendResp.errcode ?? sendResp.ret);
+  if (typeof code === 'number' && code !== 0) {
+    throw new Error(`iLink sendmessage ret=${code} ${sendResp?.errmsg ?? ''}`.trim());
+  }
+  log(`媒体已发送 [${peerId}]: ${kind} ${path.basename(filePath)} (${Math.round(plaintext.length / 1024)}KB)`);
+  return true;
+}
+
+// 从回复文本中提取"本地存在的产出文件路径"（存在性过滤，去重，最多 5 个）
+const FILE_HINT_RE = /([^\s"'`\u3002\uFF0C\uFF1B\uFF1A:;,，；：、()（）【】]+\.(?:png|jpe?g|gif|webp|bmp|csv|xlsx?|txt|md|pdf|json|zip|ya?ml|html?|xml))/gi;
+function extractFilePaths(text) {
+  if (!text) return [];
+  const out = [];
+  const seen = new Set();
+  for (const m of String(text).matchAll(FILE_HINT_RE)) {
+    let p = m[1].trim().replace(/^[（(\[]+|[）)\]]+$/g, '');
+    if (!p || seen.has(p)) continue;
+    try {
+      if (!fs.existsSync(p) || !fs.statSync(p).isFile()) continue;
+    } catch { continue; }
+    if (/node_modules|\/\.git\/|logs[\\/]|\.DS_Store/.test(p)) continue;
+    seen.add(p);
+    out.push(p);
+    if (out.length >= 5) break;
+  }
+  return out;
+}
+
+// 「发文件」输入解析：1) 直接路径存在则用之；2) 否则在候选工作目录（绑定会话 cwd + 桥接 cwd）里
+// 按文件名精确匹配；3) 仍找不到则按包含匹配；唯一命中才返回，否则返回 null（避免发错文件）。
+async function candidateDirs() {
+  const dirs = new Set([process.cwd()]);
+  const sessionId = resolveSession();
+  if (sessionId) {
+    try {
+      const { items } = await dshRpc('session.list', {}, 15_000);
+      const s = (items ?? []).find((x) => x.sessionId === sessionId);
+      if (s?.cwd && fs.existsSync(s.cwd)) dirs.add(s.cwd);
+    } catch {}
+  }
+  return [...dirs];
+}
+async function resolveFileToSend(input) {
+  const t = String(input ?? '').trim();
+  if (!t) return null;
+  if (fs.existsSync(t) && fs.statSync(t).isFile()) return t;
+  const dirs = await candidateDirs();
+  const seen = new Set();
+  const exact = [];
+  for (const dir of dirs) {
+    const cand = path.join(dir, t);
+    if (seen.has(cand)) continue;
+    seen.add(cand);
+    if (fs.existsSync(cand) && fs.statSync(cand).isFile()) exact.push(cand);
+  }
+  if (exact.length === 1) return exact[0];
+  if (exact.length > 1) return null; // 多个同名：让用户给完整路径
+  // 包含匹配（basename 含关键字）
+  const kw = path.basename(t).toLowerCase();
+  const fuzzy = [];
+  for (const dir of dirs) {
+    let names;
+    try { names = fs.readdirSync(dir); } catch { continue; }
+    for (const n of names) {
+      const full = path.join(dir, n);
+      if (seen.has(full)) continue;
+      seen.add(full);
+      try {
+        if (fs.statSync(full).isFile() && n.toLowerCase().includes(kw)) fuzzy.push(full);
+      } catch {}
+    }
+  }
+  return fuzzy.length === 1 ? fuzzy[0] : null;
+}
+
+// 推送文本后自动发送其中提到的"最后一个"文件（结果里可能多个路径，通常最后一个才是最终产出）；
+// 需要其它文件用手动指令「发文件 <路径>」。10 分钟内不重复发同一文件。
+const sentFileCache = new Map(); // filePath -> lastSentAt
+async function sendReplyFiles(peerId, contextToken, text) {
+  if (!peerId || !contextToken) return;
+  const files = extractFilePaths(text);
+  if (!files.length) return;
+  const f = files[files.length - 1]; // 只发最后一个
+  if (Date.now() - (sentFileCache.get(f) || 0) < 10 * 60 * 1000) return;
+  try {
+    await sendMediaFile(peerId, contextToken, f);
+    sentFileCache.set(f, Date.now());
+  } catch (e) {
+    log('发送文件失败:', f, '|', e.message);
+  }
 }
 
 function sanitizeFileName(name) {
@@ -831,6 +1038,7 @@ async function handleMessage(msg) {
     peerTokens.set(peerId, contextToken);
     lastActivePeer = peerId;
     saveState();
+    await flushPendingReplies(peerId, contextToken); // 凭证已刷新：补发之前发送失败的回复
   }
 
   // 提取文字：文本消息直接取 text_item.text；
@@ -922,6 +1130,22 @@ async function handleMessage(msg) {
     reply = await handleWorkspaceList(peerId); // 直接进入工作区选择并新开对话
   } else if (isCmd(t, STATUS_CMD, STATUS_ALIASES)) {
     reply = await handleStatusCmd(peerId);
+  } else if (/^(发文件|发送文件|发图片|发送图片)/.test(t.trim())) {
+    // 手动发送指定文件/图片到微信
+    const rest = t.replace(/^(发文件|发送文件|发图片|发送图片)/, '').trim().replace(/[。！？!?,.，；;]+$/g, '');
+    if (rest) {
+      try {
+        const fp = await resolveFileToSend(rest);
+        if (!fp) {
+          reply = `（在当前工作目录未找到「${rest}」，请用完整路径：发文件 /完整/路径/文件）`;
+        } else {
+          await sendMediaFile(peerId, contextToken, fp);
+          reply = '';
+        }
+      } catch (e) { reply = `（发送文件失败：${e.message}）`; }
+    } else {
+      reply = '（用法：发文件 <文件名或路径>，如：发文件 每日分析.csv）';
+    }
   } else {
     const pend = switchPending.get(peerId);
     if (pend && Date.now() < pend.expireAt) {
@@ -960,10 +1184,12 @@ async function handleMessage(msg) {
         // 阶段回复 onStage：DSH 每步定稿文本一出现就立即发微信，不等最终结果；
         // 发送失败会抛错（不推进 deliveredText，最终回复会补发该内容，不丢失）
         reply = await promptWithStatus(peerId, contextToken, sessionId, t, () => run.cancelled,
-          (txt) => {
+          async (txt) => {
+            // 先发送成功，再记录日志（失败抛错→deliveredText 不推进→最终回复补发，日志不产生误导）
+            await sendTextWithRetry(peerId, contextToken, txt);
             sentRef.at = Date.now(); // 每次发给微信后重置 30 秒状态计时
             log(`阶段回复已发送 [${peerId}]: ${txt.slice(0, 40)}${txt.length > 40 ? '…' : ''}`);
-            return sendTextWithRetry(peerId, contextToken, txt);
+            void sendReplyFiles(peerId, contextToken, txt); // 自动发送回复中提到的文件/图片
           },
           deliveredRef, sentRef, startAt);
         if (reply && reply === deliveredRef.current) reply = ''; // 最终文本已随阶段回复发出，避免重复
@@ -985,6 +1211,7 @@ async function handleMessage(msg) {
     } catch (e) {
       errorCount++;
       log('发送消息失败:', e.message);
+      enqueuePendingReply(peerId, reply); // 最终回复发送失败：暂存，等下次发消息后补发
     }
     log(`已回复 [${peerId}]: ${reply.slice(0, 80)}${reply.length > 80 ? '…' : ''}`);
   } else {
@@ -1035,10 +1262,19 @@ async function watchForeignReplies() {
       if (event.type === 'assistant/message') {
         const txt = extractText(event.data?.message?.content);
         if (txt && txt !== st.lastText) {
-          if (!(await syncPush(txt, st))) break; // 失败/冷却中：游标不动，下轮重试
+          const pushed = await syncPush(txt, st);
+          if (!pushed) {
+            // 发送失败：文本已入队待补发（syncPush 内部 enqueue）。继续推进游标，
+            // 让后续文本（含最终回复）也依次入队，避免"断点卡住导致最终不补发"。
+            cursor = seq;
+            noteAssistantText(sessionId, txt);
+            continue;
+          }
           st.lastText = txt;
           cursor = seq;
           noteAssistantText(sessionId, txt); // 检测"编号选项提问"→记录待回答状态
+          // 自动发送回复中提到的本地文件/图片（不阻塞文本推送）
+          void sendReplyFiles(lastActivePeer, lastActivePeer ? peerTokens.get(lastActivePeer) : null, txt);
         }
       } else if (event.type === 'turn/end') {
         const notice = relayReasonText(event.data?.reason ?? null);
@@ -1098,8 +1334,9 @@ async function syncPush(text, st) {
     log(`同步推送已发送 [${peerId}]: ${text.slice(0, 40)}${text.length > 40 ? '…' : ''}`);
     return true;
   } catch (e) {
+    enqueuePendingReply(peerId, text); // 发送失败：暂存，等下次发消息刷新凭证后补发
     if (!st.lastLoggedAt || Date.now() - st.lastLoggedAt >= SYNC_RETRY_MS)
-      log('同步推送失败（将自动重试）:', e.message, '|', text.slice(0, 30));
+      log('同步推送失败（将自动重试+待补发）:', e.message, '|', text.slice(0, 30));
     st.lastLoggedAt = Date.now();
     st.lastFailAt = Date.now();
     return false;
