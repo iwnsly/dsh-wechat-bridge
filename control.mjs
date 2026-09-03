@@ -178,7 +178,7 @@ function relayCursor(sessionId) {
   let st = sessionRelay.get(sessionId);
   if (!st) {
     st = {
-      lastSeq: 0, lastText: '', initialized: false,
+      lastSeq: 0, lastText: '', lastSent: '', lastPushAt: 0, initialized: false,
       lastFailAt: 0, lastLoggedAt: 0,   // 失败冷却/日志节流
       lastSentAt: Date.now(),           // 视为“刚发送过”，30 秒后才可能发状态（避免启动即发“已等待 N 秒”）
       lastEventAt: 0, taskStartAt: 0,   // 30 秒状态：最新事件时间 / 任务起点
@@ -1297,27 +1297,31 @@ async function watchForeignReplies() {
       if (event.type === 'assistant/message') {
         const txt = extractText(event.data?.message?.content);
         if (txt && txt !== st.lastText) {
-          const pushed = await syncPush(txt, st);
-          if (!pushed) {
-            // 发送失败：文本已入队待补发（syncPush 内部 enqueue）。继续推进游标，
-            // 让后续文本（含最终回复）也依次入队，避免"断点卡住导致最终不补发"。
-            cursor = seq;
-            noteAssistantText(sessionId, txt);
-            continue;
+          st.lastText = txt; // 始终记录最新文本（节流跳过时也更新）
+          // 推送节流：距上次推送 <60s 则跳过（避免高频触发 iLink 风控）；
+          // turn/end 时会把最新未推文本补推（最终必达），故中间被节流的不会丢最终。
+          const throttled = st.lastPushAt !== 0 && Date.now() - st.lastPushAt < PUSH_THROTTLE_MS;
+          if (!throttled && txt !== st.lastSent) {
+            const pushed = await syncPush(txt, st);
+            if (pushed) { st.lastSent = txt; st.lastPushAt = Date.now(); }
+            // 发送失败：文本已入队待补发（syncPush 内部 enqueue），游标继续推进
           }
-          st.lastText = txt;
           cursor = seq;
           noteAssistantText(sessionId, txt); // 检测"编号选项提问"→记录待回答状态
           // 自动发送回复中提到的本地文件/图片（不阻塞文本推送）
           void sendReplyFiles(lastActivePeer, lastActivePeer ? peerTokens.get(lastActivePeer) : null, txt);
         }
       } else if (event.type === 'turn/end') {
-        const notice = relayReasonText(event.data?.reason ?? null);
-        if (notice && notice !== st.lastText) {
-          if (!(await syncPush(notice, st))) break;
-          st.lastText = notice;
-          cursor = seq;
+        // 最终必达：turn 结束，把最新未推的文本补推（即使之前被节流/失败跳过）
+        if (st.lastText && st.lastText !== st.lastSent) {
+          const pushed = await syncPush(st.lastText, st);
+          if (pushed) { st.lastSent = st.lastText; st.lastPushAt = Date.now(); }
         }
+        const notice = relayReasonText(event.data?.reason ?? null);
+        if (notice && notice !== st.lastSent) {
+          if (await syncPush(notice, st)) st.lastSent = notice;
+        }
+        cursor = seq;
       }
       cursor = Math.max(cursor, seq);
     }
@@ -1352,6 +1356,9 @@ async function watchForeignReplies() {
 // 反而加重发送风控（prepare failed）并刷屏日志。改为 5 分钟一次低频重试，帮助风控恢复；
 // 不丢消息：失败文本已入待补发队列，凭证/风控恢复后自动补发。
 const SYNC_RETRY_MS = 5 * 60 * 1000;
+// 同步推送节流：网页端任务阶段回复每 60 秒最多推 1 条（避免高频触发 iLink 风控）；
+// turn/end 时最新未推文本会补推（最终必达），中间被节流的不会丢最终。
+const PUSH_THROTTLE_MS = 60_000;
 async function syncPush(text, st) {
   if (st.lastFailAt && Date.now() - st.lastFailAt < SYNC_RETRY_MS) return false; // 冷却中
   const peerId = lastActivePeer;
