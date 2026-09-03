@@ -357,7 +357,7 @@ function noteSendFailure(err) {
     rateLimitStreak++;
     if (rateLimitStreak >= 3) {
       rateLimitUntil = Date.now() + RATE_LIMIT_COOLDOWN_MS;
-      log(`检测到 iLink 发送风控（连续 ${rateLimitStreak} 次失败），暂停发送 ${RATE_LIMIT_COOLDOWN_MS / 60000} 分钟，到期自动恢复`);
+      log(`连续 ${rateLimitStreak} 次发送失败（prepare failed）——多半是微信会话失活；请发一条微信消息即可立即恢复（冷却 ${RATE_LIMIT_COOLDOWN_MS / 60000} 分钟兜底）`);
       rateLimitStreak = 0;
     }
   } else {
@@ -1115,6 +1115,7 @@ async function handleMessage(msg) {
     peerTokens.set(peerId, contextToken);
     lastActivePeer = peerId;
     saveState();
+    rateLimitUntil = 0; // 收到微信消息 = 会话重新激活，立即解除发送冷却（无需等 3 分钟）
     await flushPendingReplies(peerId, contextToken); // 凭证已刷新：补发之前发送失败的回复
   }
 
