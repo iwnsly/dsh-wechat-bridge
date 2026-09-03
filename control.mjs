@@ -276,7 +276,10 @@ async function promptAndCollect(sessionId, text, isCancelled, onStage, delivered
                 deliveredText = txt; // 发送成功才推进；失败则最终回复会补发这段内容，不丢失
                 noteAssistantText(sessionId, txt); // 检测"编号选项提问"→记录待回答状态
                 maybeNotifyConfirm(sessionId); // 权限/确认类请求 → 微信推「是/否」提示
-              } catch { /* 阶段发送失败：留待最终回复兜底 */ }
+              } catch {
+                // 中间阶段发送失败：也入队待补发（补发时按会话取最新一条），不静默丢弃
+                enqueuePendingReply(lastActivePeer, txt, sessionId);
+              }
             }
           }
         } else if (event.type === 'turn/start') {
