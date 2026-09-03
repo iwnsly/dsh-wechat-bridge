@@ -193,6 +193,22 @@ function relayCursor(sessionId) {
   }
   return st;
 }
+// 切换会话后重置监听游标：从切换时刻起重新初始化（不回放切走期间/之前的旧回复）。
+// watchForeignReplies 下一轮会重新拉窗口并记录"最后一条回复文本"，
+// 使"切换时任务进行中、切换后立即结束"的场景仍能在 turn/end 触发最终必达。
+function resetRelayCursor(sessionId) {
+  const st = relayCursor(sessionId);
+  st.lastSeq = 0;
+  st.lastText = '';
+  st.lastSent = '';
+  st.lastPushAt = 0;
+  st.initialized = false;
+  st.lastFailAt = 0;
+  st.lastLoggedAt = 0;
+  st.taskStartAt = Date.now();
+  st.lastEventAt = 0;
+  st.lastSentAt = Date.now();
+}
 // 把 DSH 的 turn/end reason 翻译成要给微信看的文案；正常结束返回 null
 function relayReasonText(reason) {
   if (!reason) return null;
@@ -750,6 +766,9 @@ async function applySwitchChoice(peerId, contextToken, n) {
   if (!s) return `编号 ${n} 不在清单里，请再发一次「切换对话」重新选择。`;
   setDefaultSession(s.sessionId);
   log(`微信切换对话 [${peerId}] → ${s.sessionId}`);
+  // 从切换时刻起重新监听目标会话：不推送/回放切换前的旧回复；
+  // 若目标会话有进行中的任务，切换后产生的新回复会持续推送直至任务结束（turn/end 最终必达）。
+  resetRelayCursor(s.sessionId);
   // 切换成功后：只补发目标会话积压的"最后一条"（不回放旧阶段回复，也不带出其它会话的积压）
   try { await flushPendingReplies(peerId, contextToken ?? null, s.sessionId); }
   catch { /* 补发失败已在 flush 内部保留待下次 */ }
@@ -1383,6 +1402,16 @@ async function watchForeignReplies() {
       try {
         const h = await dshRpc('session.history', { sessionId, maxMessages: 10 });
         st.lastSeq = Math.max(0, ...(h?.events ?? []).map((e) => Number(e?.event?.seq ?? 0)));
+        // 记录窗口内最后一条非空回复文本（不推送）：若"切换/关注时刻任务进行中，
+        // 之后立刻结束"，turn/end 时可用它做最终必达，避免最终回复被游标起点跳过。
+        st.lastText = '';
+        for (const { event } of h?.events ?? []) {
+          if (event?.type === 'assistant/message') {
+            const txt = extractText(event.data?.message?.content);
+            if (txt) st.lastText = txt;
+          }
+        }
+        st.lastSent = '';
         st.initialized = true;
         st.taskStartAt = Date.now(); // 任务起点近似=关注时刻（30 秒状态的累计秒数基准）
       } catch { continue; }
