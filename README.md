@@ -208,5 +208,6 @@ git push              # 推送 origin/main
 
 - 改动涉及运行中进程时，先 `node --check control.mjs` 再按部署纪律重启（见「部署与自启」）。
 - 新增运行时依赖若改动了 `package.json`，记得一并提交。
+- **每次代码改动必须同步更新说明文件**：`README.md`（使用说明，含指令/接口/配置）与 `代码说明.md`（实现说明，含模块/机制/常量），随代码一起提交。
 - 用 `gh auth login` 或系统钥匙串免密推送；也可改用 SSH：`git remote set-url origin git@github.com:iwnsly/dsh-wechat-bridge.git`。
 - 每次扫码 Bot ID 会变，属 iLink 平台正常现象；登录态存 `config.json`（600），重启免扫码。
