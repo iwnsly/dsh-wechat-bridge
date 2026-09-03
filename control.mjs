@@ -373,16 +373,14 @@ function enqueuePendingReply(peerId, text) {
 async function flushPendingReplies(peerId, contextToken) {
   const arr = pendingReplies.get(peerId);
   if (!arr || !arr.length || !contextToken) return;
-  const items = arr.splice(0);
-  for (const t of items) {
-    try {
-      await sendTextWithRetry(peerId, contextToken, t, 2);
-      log(`补发成功 [${peerId}]: ${t.slice(0, 40)}${t.length > 40 ? '…' : ''}`);
-    } catch (e) {
-      pendingReplies.set(peerId, [t, ...(pendingReplies.get(peerId) ?? [])]); // 放回队首待下次
-      log('补发失败（保留待下次）:', e.message);
-      return;
-    }
+  const last = arr[arr.length - 1]; // 只补发最后一条（最新/最终结果），不刷屏
+  pendingReplies.delete(peerId); // 清空积压
+  try {
+    await sendTextWithRetry(peerId, contextToken, `（补发）${last}`);
+    log(`补发成功 [${peerId}]: ${last.slice(0, 40)}${last.length > 40 ? '…' : ''}`);
+  } catch (e) {
+    pendingReplies.set(peerId, [last]); // 失败保留，等下次发消息再补
+    log('补发失败（保留待下次）:', e.message);
   }
 }
 
@@ -490,6 +488,8 @@ const NEW_CMD = '新对话';
 const NEW_ALIASES = ['新建对话', '新开会话', '新开对话'];
 const STATUS_CMD = '状态';
 const STATUS_ALIASES = ['当前状态', '状态查询', '任务状态', 'status', 'Status'];
+const HELP_CMD = '指令';
+const HELP_ALIASES = ['帮助', '菜单', 'help', 'Help', '指令列表', '有哪些指令', '怎么用'];
 
 // —— DSH 交互选择模拟 ——
 // DSH 无内建"等待用户输入"机制（无相关事件/API，prompt 仅支持 queue 模式）。
@@ -630,6 +630,23 @@ async function handleSwitchCmd(peerId) {
     log('获取会话清单失败:', e.message);
     return '（获取会话清单失败：' + (e.message ?? e) + '）';
   }
+}
+
+// 「指令」：回复当前可用的指令清单，单条发送。
+// 微信 iLink 文本：单换行 \n 会被折叠成空格，只有双换行 \n\n（空行）才渲染换行，
+// 因此每条指令之间用空行分隔（用户实测"可用指令："后换行正是双换行生效）。
+function handleHelpCmd() {
+  return [
+    '📋 可用指令：',
+    '🔀 切换对话｜切换会话 — 列出对话，发编号切换',
+    '➕ 新对话｜新建对话 — 新建会话',
+    '📊 状态｜当前状态 — 当前绑定会话状态',
+    '📄 发文件 <文件名/路径> — 发送本地文件到微信',
+    '⏹ 取消｜停｜停止 — 中断当前任务',
+    '🔢 编号（1/2/一/二）— 切换选择 / DSH 交互选择',
+    '❓ 指令｜帮助 — 显示本菜单',
+    '直接发文字/语音 = 让 DSH 处理，回复自动同步到微信。',
+  ].join('\n\n');
 }
 
 // 「状态」指令：查询当前绑定对话的状态与正在执行的任务
@@ -1130,6 +1147,8 @@ async function handleMessage(msg) {
     reply = await handleWorkspaceList(peerId); // 直接进入工作区选择并新开对话
   } else if (isCmd(t, STATUS_CMD, STATUS_ALIASES)) {
     reply = await handleStatusCmd(peerId);
+  } else if (isCmd(t, HELP_CMD, HELP_ALIASES)) {
+    reply = handleHelpCmd();
   } else if (/^(发文件|发送文件|发图片|发送图片)/.test(t.trim())) {
     // 手动发送指定文件/图片到微信
     const rest = t.replace(/^(发文件|发送文件|发图片|发送图片)/, '').trim().replace(/[。！？!?,.，；;]+$/g, '');
@@ -1469,6 +1488,29 @@ const server = http.createServer(async (req, res) => {
   if (req.method === 'GET' && pathname === '/api/logs') {
     const since = Number(url.searchParams.get('since') ?? 0);
     return json(res, 200, { ok: true, logs: ring.filter((l) => l.t > since) });
+  }
+
+  // POST /api/send  { text: '...', peerId?: 'o9cq...' }
+  // 主动给微信发一条文本消息（外部系统触发；默认发给最近联系人，可指定 peerId）。
+  // 注意：发送凭证 context_token 有效约 90-160 秒且仅在有新消息时刷新——若长时间没收到微信消息，
+  // 发送会失败并进入待补发队列（enqueued:true），你下次发微信消息后自动补发。
+  if (req.method === 'POST' && pathname === '/api/send') {
+    let body = {};
+    try { body = await readJson(req); } catch {}
+    const text = String(body.text ?? body.message ?? '').trim();
+    const peerId = body.peerId || lastActivePeer;
+    if (!text) return json(res, 200, { ok: false, error: '缺少 text 字段' });
+    if (!peerId || !peerTokens.get(peerId)) {
+      return json(res, 200, { ok: false, error: '尚无微信发送凭证（请先在微信发一条消息）' });
+    }
+    try {
+      await sendTextWithRetry(peerId, peerTokens.get(peerId), text, 2);
+      log(`API 主动发送 [${peerId}]: ${text.slice(0, 40)}${text.length > 40 ? '…' : ''}`);
+      return json(res, 200, { ok: true, sent: text });
+    } catch (e) {
+      enqueuePendingReply(peerId, text); // 凭证过期等失败：暂存，等下次发消息补发
+      return json(res, 200, { ok: false, error: e.message, enqueued: true });
+    }
   }
 
   return json(res, 404, { error: 'not found' });
