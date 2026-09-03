@@ -1,0 +1,285 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>DSH ↔ 微信 ClawBot 控制台</title>
+<style>
+  :root {
+    --bg: #0f1115; --panel: #171a21; --panel2: #1d212b; --line: #2a2f3a;
+    --text: #e6e9ef; --dim: #8b93a5; --accent: #4f8cff; --ok: #37c06a; --warn: #e8a23a; --bad: #e0555a;
+    --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.55 -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; }
+  header { display: flex; align-items: center; gap: 12px; padding: 14px 22px; border-bottom: 1px solid var(--line); }
+  header h1 { font-size: 17px; margin: 0; font-weight: 600; }
+  header .sub { color: var(--dim); font-size: 12px; }
+  .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; vertical-align: middle; }
+  .dot.ok { background: var(--ok); } .dot.warn { background: var(--warn); } .dot.bad { background: var(--bad); }
+  main { max-width: 1080px; margin: 0 auto; padding: 20px 22px 80px; }
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; margin-bottom: 20px; }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; }
+  .card h2 { font-size: 13px; color: var(--dim); margin: 0 0 8px; font-weight: 500; text-transform: uppercase; letter-spacing: .04em; }
+  .card .big { font-size: 15px; font-weight: 600; }
+  .card .meta { color: var(--dim); font-size: 12px; margin-top: 6px; font-family: var(--mono); }
+  .row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+  section { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 18px 20px; margin-bottom: 20px; }
+  section h2 { font-size: 15px; margin: 0 0 12px; }
+  button { background: var(--accent); color: #fff; border: 0; border-radius: 8px; padding: 8px 14px; font-size: 13px; cursor: pointer; }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  button.ghost { background: var(--panel2); border: 1px solid var(--line); color: var(--text); }
+  button.danger { background: var(--bad); }
+  input, select { background: var(--panel2); border: 1px solid var(--line); color: var(--text); border-radius: 8px; padding: 8px 10px; font-size: 13px; }
+  input[type=text], input[type=url] { min-width: 180px; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: left; padding: 9px 10px; border-bottom: 1px solid var(--line); vertical-align: middle; }
+  th { color: var(--dim); font-weight: 500; font-size: 12px; }
+  .mono { font-family: var(--mono); font-size: 12px; color: var(--dim); word-break: break-all; }
+  .tag { display: inline-block; padding: 2px 8px; border-radius: 20px; font-size: 11px; border: 1px solid var(--line); }
+  .tag.ok { color: var(--ok); border-color: var(--ok); } .tag.bad { color: var(--bad); border-color: var(--bad); } .tag.warn { color: var(--warn); border-color: var(--warn); }
+  #qrcode { margin: 14px 0; text-align: center; }
+  #qrcode img { width: 220px; height: 220px; image-rendering: pixelated; border: 1px solid var(--line); border-radius: 8px; background: #fff; }
+  #qrcode a { color: var(--accent); word-break: break-all; }
+  #logs { background: var(--panel2); border: 1px solid var(--line); border-radius: 8px; padding: 10px; font-family: var(--mono); font-size: 12px; max-height: 240px; overflow: auto; white-space: pre-wrap; }
+  .muted { color: var(--dim); font-size: 12px; }
+  .hint { color: var(--dim); font-size: 12px; margin-top: 8px; }
+  .empty { color: var(--dim); text-align: center; padding: 16px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>🦞 DSH ↔ 微信 ClawBot 控制台</h1>
+  <span class="sub" id="header-status"></span>
+</header>
+<main>
+  <!-- 状态卡片 -->
+  <div class="cards">
+    <div class="card">
+      <h2>DeepSeek Harness</h2>
+      <div class="big"><span class="dot" id="dsh-dot"></span><span id="dsh-text">检测中…</span></div>
+      <div class="meta" id="dsh-url"></div>
+    </div>
+    <div class="card">
+      <h2>控制服务</h2>
+      <div class="big"><span class="dot ok"></span><span>运行中</span></div>
+      <div class="meta" id="ctrl-meta"></div>
+    </div>
+    <div class="card">
+      <h2>微信 Bot</h2>
+      <div class="big"><span class="dot" id="bot-dot"></span><span id="bot-text">检测中…</span></div>
+      <div class="meta" id="bot-meta"></div>
+    </div>
+  </div>
+
+  <!-- 微信绑定 -->
+  <section>
+    <h2>微信绑定</h2>
+    <div class="row">
+      <button id="btn-bind">绑定微信</button>
+      <button class="danger" id="btn-unbind">解绑</button>
+      <span class="muted" id="bind-status"></span>
+    </div>
+    <div id="qrcode"></div>
+    <p class="hint">点击「绑定微信」生成二维码 → 用手机微信扫码并确认授权。绑定后本服务即可收到微信消息并按会话映射回复。</p>
+  </section>
+
+  <!-- 默认会话 -->
+  <section>
+    <h2>默认会话</h2>
+    <div class="row">
+      <label class="muted">微信消息进入的会话</label>
+      <select id="default-session" style="max-width:420px"><option value="">— 未设置 —</option></select>
+    </div>
+    <p class="hint">微信（唯一绑定）发的消息默认进入该会话；在微信里发「切换对话」可随时切换，「新对话」可直接新开对话窗口，切换后这里会自动同步。</p>
+  </section>
+
+  <!-- 会话列表 -->
+  <section>
+    <h2>会话列表 <span class="muted" id="session-refresh-time" style="font-weight:400"></span></h2>
+    <div class="row" style="margin-bottom:12px">
+      <span class="muted">每 15 秒自动刷新，已过滤归档与空白会话（与 DSH 网页显示一致）</span>
+      <button class="ghost" id="btn-refresh-sessions">立即刷新</button>
+    </div>
+    <table>
+      <thead><tr><th style="width:52px">#</th><th>标题</th><th>Session ID</th><th style="width:180px">状态</th></tr></thead>
+      <tbody id="session-list-rows"><tr><td colspan="4" class="empty">加载中…</td></tr></tbody>
+    </table>
+  </section>
+
+  <!-- 最近日志 -->
+  <section>
+    <h2>最近日志</h2>
+    <div id="logs">（暂无日志）</div>
+  </section>
+</main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const NEW_OPT = '__new__';
+let lastLogT = 0;
+
+async function api(path, opts) {
+  const res = await fetch(path, {
+    headers: { 'content-type': 'application/json' },
+    ...opts,
+  });
+  return res.json();
+}
+async function postJson(path, body) {
+  return api(path, { method: 'POST', body: JSON.stringify(body ?? {}) });
+}
+
+function fillSessionSelect(sel, items, { withNew = false, preserve = true } = {}) {
+  const prev = sel.value;
+  sel.innerHTML = '';
+  if (withNew) {
+    const o = document.createElement('option');
+    o.value = NEW_OPT; o.textContent = '➕ 新建会话';
+    sel.appendChild(o);
+  }
+  for (const it of items) {
+    const o = document.createElement('option');
+    o.value = it.sessionId;
+    const title = (it.title || '').replace(/\s+/g, ' ').trim();
+    o.textContent = title ? `${title} — ${it.sessionId}` : it.sessionId;
+    sel.appendChild(o);
+  }
+  if (preserve && prev && [...sel.options].some((o) => o.value === prev)) sel.value = prev;
+}
+
+const SESSION_REFRESH_MS = 15000;
+
+async function refreshStatus() {
+  const st = await api('/api/status');
+  // DSH
+  const dsh = st.dsh ?? { ok: false, error: 'no data' };
+  $('dsh-dot').className = 'dot ' + (dsh.ok ? 'ok' : 'bad');
+  $('dsh-text').textContent = dsh.ok ? '可用' : '不可达';
+  $('dsh-url').textContent = dsh.ok ? st.dshUrl : (st.dshUrl + ' — ' + (dsh.error || ''));
+  $('header-status').textContent = st.ok ? '运行中' : '';
+
+  // Bot
+  const b = st.bot ?? {};
+  let botLabel, botCls, botMeta;
+  if (b.state === 'binding') { botLabel = '扫码绑定中'; botCls = 'warn'; botMeta = b.bindMessage || ''; }
+  else if (b.state === 'bound') { botLabel = '已绑定 / 监听中'; botCls = 'ok'; botMeta = b.boundAt ? '绑定于 ' + new Date(b.boundAt).toLocaleString() : ''; }
+  else { botLabel = '未绑定'; botCls = 'bad'; botMeta = '点击「绑定微信」开始'; }
+  $('bot-dot').className = 'dot ' + botCls;
+  $('bot-text').textContent = botLabel;
+  $('bot-meta').textContent = botMeta + (b.lastMessageAt ? ` ｜ 最近消息 ${new Date(b.lastMessageAt).toLocaleTimeString()}` : '') + ` ｜ 已处理 ${b.handled ?? 0} 条`;
+  $('btn-bind').disabled = b.state === 'bound' || b.state === 'binding';
+  $('btn-unbind').disabled = b.state !== 'bound';
+  $('bind-status').textContent = (b.state === 'bound') ? '已绑定，正在监听微信消息。' : (b.state === 'binding' ? '等待扫码…' : '未绑定。');
+
+  // QR
+  const qr = $('qrcode');
+  qr.innerHTML = '';
+  if (b.qrcode) {
+    if (String(b.qrcode).startsWith('http')) {
+      const wrap = document.createElement('div');
+      const p = document.createElement('p');
+      p.className = 'muted';
+      p.textContent = '请在手机微信中打开以下链接（可复制后发给「文件传输助手」再点开），在手机上确认连接：';
+      wrap.appendChild(p);
+      const a = document.createElement('a');
+      a.href = b.qrcode; a.target = '_blank'; a.rel = 'noopener';
+      a.textContent = b.qrcode;
+      const btn = document.createElement('button');
+      btn.style.marginLeft = '8px'; btn.textContent = '复制链接';
+      btn.onclick = async () => {
+        try { await navigator.clipboard.writeText(b.qrcode); btn.textContent = '已复制'; }
+        catch { btn.textContent = '复制失败'; }
+        setTimeout(() => (btn.textContent = '复制链接'), 2000);
+      };
+      wrap.appendChild(document.createElement('div'));
+      const row = document.createElement('div');
+      row.appendChild(a); row.appendChild(btn);
+      wrap.appendChild(row);
+      qr.appendChild(wrap);
+    } else {
+      const img = document.createElement('img');
+      img.src = b.qrcode; img.alt = '登录二维码';
+      qr.appendChild(img);
+    }
+  }
+}
+
+async function refreshSessions() {
+  const [ses, cfg] = await Promise.all([api('/api/sessions'), api('/api/config')]);
+  const items = (ses.ok ? ses.items : []) ?? [];
+
+  // 默认会话下拉
+  fillSessionSelect($('default-session'), items, { withNew: false });
+
+  // 默认会话
+  const def = cfg.defaultSessionId || '';
+  if (def) $('default-session').value = def;
+
+  // 会话列表表格
+  const stbody = $('session-list-rows');
+  stbody.innerHTML = '';
+  if (!items.length) {
+    const tr = document.createElement('tr');
+    const td = document.createElement('td');
+    td.colSpan = 4; td.className = 'empty'; td.textContent = '（暂无会话）';
+    tr.appendChild(td); stbody.appendChild(tr);
+  }
+  items.forEach((s, i) => {
+    const tr = document.createElement('tr');
+    const td1 = document.createElement('td'); td1.textContent = (i + 1) + '.';
+    const td2 = document.createElement('td'); td2.textContent = s.title || '（无标题）';
+    const td3 = document.createElement('td'); td3.className = 'mono'; td3.textContent = s.sessionId;
+    const td4 = document.createElement('td');
+    const tags = [];
+    if (s.running) tags.push(['ok', '运行中']); else tags.push(['', '空闲']);
+    if (s.blank) tags.push(['', '空白']);
+    if (def === s.sessionId) tags.push(['ok', '默认']);
+    for (const [cls, label] of tags) {
+      const sp = document.createElement('span');
+      sp.className = 'tag ' + cls; sp.textContent = label;
+      sp.style.marginRight = '6px';
+      td4.appendChild(sp);
+    }
+    tr.append(td1, td2, td3, td4);
+    stbody.appendChild(tr);
+  });
+
+  $('session-refresh-time').textContent = '· 上次刷新 ' + new Date().toLocaleTimeString();
+}
+
+async function refreshLogs() {
+  const logsRes = await api('/api/logs?since=' + lastLogT);
+  if (logsRes.logs?.length) {
+    lastLogT = Math.max(lastLogT, ...logsRes.logs.map((l) => l.t));
+    const el = $('logs');
+    const prev = el.textContent;
+    const add = logsRes.logs.map((l) => new Date(l.t).toLocaleTimeString() + '  ' + l.line).join('\n');
+    el.textContent = prev === '（暂无日志）' ? add : prev + (add ? '\n' + add : '');
+    el.scrollTop = el.scrollHeight;
+  }
+}
+
+async function refresh() {
+  await Promise.all([refreshStatus(), refreshSessions(), refreshLogs()]);
+}
+
+$('btn-refresh-sessions').onclick = () => refreshSessions();
+$('btn-bind').onclick = async () => { await postJson('/api/bind'); refresh(); };
+$('btn-unbind').onclick = async () => {
+  if (!confirm('确定解绑当前微信？')) return;
+  await postJson('/api/unbind');
+  refresh();
+};
+$('default-session').onchange = async () => {
+  await postJson('/api/config', { defaultSessionId: $('default-session').value || null });
+  refresh();
+};
+
+refresh();
+setInterval(refreshStatus, 3000);
+setInterval(refreshSessions, SESSION_REFRESH_MS);
+setInterval(refreshLogs, 3000);
+</script>
+</body>
+</html>

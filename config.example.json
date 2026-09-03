@@ -1,0 +1,7 @@
+{
+  "dsh": { "url": "http://127.0.0.1:3080" },
+  "wechat": {
+    "botToken": "在此填入微信 iLink botToken（形如 xxx@im.bot:xxxxxx），实际配置在 config.json（已 gitignore）"
+  },
+  "defaultSessionId": "可选：默认绑定的 DSH 会话 id"
+}

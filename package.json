@@ -1,0 +1,16 @@
+{
+  "name": "dsh-wechat-bridge",
+  "version": "1.1.0",
+  "private": true,
+  "type": "module",
+  "description": "把 DeepSeek Harness Web 的对话接到微信官方 ClawBot（免部署 OpenClaw），带配置网页 + 服务监控",
+  "scripts": {
+    "start": "node control.mjs",
+    "control": "node control.mjs",
+    "bridge": "node dsh-bridge.mjs",
+    "bot": "node wechat-bot.mjs"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

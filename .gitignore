@@ -1,0 +1,12 @@
+# —— 敏感凭证：绝不上传 ——
+# config.json 含微信 botToken；state.json 含微信 context_token 发送凭证
+config.json
+state.json
+
+# —— 运行时日志 ——
+logs/
+*.log
+
+# —— 系统 / 工具 ——
+.DS_Store
+node_modules/
