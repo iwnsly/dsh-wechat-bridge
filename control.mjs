@@ -57,7 +57,8 @@ let config = loadConfig();
 // ---------------- 微信发送凭证持久化（重启后仍可继续同步推送） ----------------
 const STATE_PATH = CONFIG_PATH.replace(/config\.json$/, 'state.json');
 // 待补发队列（发送失败暂存，凭证刷新后自动补发；持久化到 state.json 跨重启不丢）
-const pendingReplies = new Map(); // peerId -> string[]
+// peerId -> [{ sessionId, text }]；按 DSH 会话隔离，切换时不会回放其它会话的旧阶段回复。
+const pendingReplies = new Map();
 function loadState() {
   try { return JSON.parse(fs.readFileSync(STATE_PATH, 'utf8')) ?? {}; } catch { return {}; }
 }
@@ -168,7 +169,12 @@ const prevState = loadState();
 // 恢复待补发队列（跨重启不丢；发送失败的回复在凭证刷新后自动补发）
 if (prevState?.pendingReplies && typeof prevState.pendingReplies === 'object') {
   for (const [peer, arr] of Object.entries(prevState.pendingReplies)) {
-    if (Array.isArray(arr) && arr.length) pendingReplies.set(peer, arr.filter(Boolean));
+    if (!Array.isArray(arr) || !arr.length) continue;
+    // 兼容旧版 string[] 状态：归属到启动时的当前默认会话。
+    const normalized = arr.filter(Boolean).map((entry) => typeof entry === 'string'
+      ? { sessionId: config.defaultSessionId ?? null, text: entry }
+      : entry);
+    pendingReplies.set(peer, normalized.filter((entry) => entry?.text));
   }
 }
 const peerTokens = new Map(Object.entries(prevState.peerTokens ?? {})); // peerId -> context_token
@@ -391,27 +397,38 @@ async function sendTextWithRetry(peerId, contextToken, text, tries = 2) {
 // 发送失败的回复先暂存，等用户下次发微信消息（刷新 context_token）后自动补发，
 // 解决"长任务期间凭证失效导致回复静默丢失"的问题（两次实锤过）。
 // 声明见顶部 state 区（持久化用）；此处仅定义操作函数。
-function enqueuePendingReply(peerId, text) {
+function enqueuePendingReply(peerId, text, sessionId = resolveSession()) {
   if (!peerId || !text) return;
   let arr = pendingReplies.get(peerId);
   if (!arr) { arr = []; pendingReplies.set(peerId, arr); }
-  if (arr.includes(text)) return; // 去重
-  if (arr.length >= 10) arr.shift(); // 上限
-  arr.push(text);
+  const dup = arr.some((entry) => entry.sessionId === sessionId && entry.text === text);
+  if (dup) return; // 同会话同文本去重
+  if (arr.length >= 20) arr.shift(); // 上限（多会话各保留最新）
+  arr.push({ sessionId, text });
   saveState(); // 失败发生后立即持久化，进程重启也不丢待补发文本
-  log(`待补发入队 [${peerId}]: ${text.slice(0, 30)}${text.length > 30 ? '…' : ''}`);
+  log(`待补发入队 [${peerId}] 会话=${sessionId?.slice(0, 12) ?? '-'}: ${text.slice(0, 30)}${text.length > 30 ? '…' : ''}`);
 }
-async function flushPendingReplies(peerId, contextToken) {
+async function flushPendingReplies(peerId, contextToken, sessionId = resolveSession()) {
   const arr = pendingReplies.get(peerId);
-  if (!arr || !arr.length || !peerId) return;
-  const last = arr[arr.length - 1]; // 只补发最后一条（最新/最终结果），不刷屏
+  if (!arr || !arr.length || !peerId || !sessionId) return;
+  // 命中当前会话的积压；sessionId 为 null 的条目是外部主动消息，可随任意会话一起补发。
+  const matched = arr.filter((entry) => entry.sessionId === sessionId || entry.sessionId == null);
+  if (!matched.length) return;
+  const last = matched[matched.length - 1]; // 只补发其中最后一条（最新/最终结果），不刷屏
+  // 只清掉本次命中的旧条目（同会话或主动消息的历史积压），只保留其它会话的待补发。
+  const remaining = arr.filter((entry) => !matched.includes(entry));
+  if (remaining.length) pendingReplies.set(peerId, remaining);
+  else pendingReplies.delete(peerId);
+  saveState();
   // context_token 可为空：sendText 内部会自动尝试无 token 发送，适合定时任务场景。
-  pendingReplies.delete(peerId); // 清空积压
   try {
-    await sendTextWithRetry(peerId, contextToken, `（补发）${last}`);
-    log(`补发成功 [${peerId}]: ${last.slice(0, 40)}${last.length > 40 ? '…' : ''}`);
+    await sendTextWithRetry(peerId, contextToken, `（补发）${last.text}`);
+    log(`补发成功 [${peerId}] 会话=${last.sessionId?.slice(0, 12) ?? '主动'}: ${last.text.slice(0, 40)}${last.text.length > 40 ? '…' : ''}`);
   } catch (e) {
-    pendingReplies.set(peerId, [last]); // 失败保留，等下次发消息再补
+    const restored = pendingReplies.get(peerId) ?? [];
+    restored.push(last); // 失败保留，等下次发消息或定时补发
+    pendingReplies.set(peerId, restored);
+    saveState();
     log('补发失败（保留待下次）:', e.message);
   }
 }
@@ -733,6 +750,9 @@ async function applySwitchChoice(peerId, contextToken, n) {
   if (!s) return `编号 ${n} 不在清单里，请再发一次「切换对话」重新选择。`;
   setDefaultSession(s.sessionId);
   log(`微信切换对话 [${peerId}] → ${s.sessionId}`);
+  // 切换成功后：只补发目标会话积压的"最后一条"（不回放旧阶段回复，也不带出其它会话的积压）
+  try { await flushPendingReplies(peerId, contextToken ?? null, s.sessionId); }
+  catch { /* 补发失败已在 flush 内部保留待下次 */ }
   const name = (s.title && s.title.trim()) ? s.title : s.sessionId;
   // 切换成功后回复「将要切换到的」目标会话的状态（空闲 / 正在执行的阶段回复 + 当前命令）
   if (contextToken) {
@@ -1626,7 +1646,7 @@ const server = http.createServer(async (req, res) => {
       log(`API 主动发送 [${peerId}]: ${text.slice(0, 40)}${text.length > 40 ? '…' : ''}`);
       return json(res, 200, { ok: true, sent: text });
     } catch (e) {
-      enqueuePendingReply(peerId, text); // 凭证过期等失败：暂存，等下次发消息补发
+      enqueuePendingReply(peerId, text, null); // 外部主动消息：不绑定 DSH 会话，随任意会话补发
       return json(res, 200, { ok: false, error: e.message, enqueued: true });
     }
   }
