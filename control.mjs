@@ -760,25 +760,27 @@ const ITEM_VOICE = 3;
 
 async function sendText(peerId, contextToken, text) {
   const clientId = `openclaw-weixin-${Math.floor(Math.random() * 0xFFFFFFFF).toString(16).padStart(8, '0')}`;
-  const resp = await wxPost('ilink/bot/sendmessage', {
+  const base = {
     msg: {
-      from_user_id: '',
-      to_user_id: peerId,
-      client_id: clientId,
-      message_type: 2,
-      message_state: 2,
-      context_token: contextToken,
+      from_user_id: '', to_user_id: peerId, client_id: clientId,
+      message_type: 2, message_state: 2,
       item_list: [{ type: 1, text_item: { text } }],
     },
     base_info: { channel_version: '1.0.2' },
-  }, token);
-  // 校验 iLink 返回码：失败时可能是 errcode 也可能是 ret（实测 sendmessage 失败返回 {ret:-2}）。
-  // 此前只查 errcode 会把 ret 失败误判为成功 → 微信端静默丢失（两次实锤）。
-  const code = resp && (resp.errcode ?? resp.ret);
-  if (typeof code === 'number' && code !== 0) {
-    const msg = `iLink sendmessage ret=${code} ${resp?.errmsg ?? ''}`.trim();
-    log(msg);
-    throw new Error(msg);
+  };
+  // 先带 context_token 发送（保持会话上下文）。实测：token 过期时返回 ret=-2，
+  // 此时 fallback 改为不带 token 发送——不带 token 可正常送达（已实测），
+  // 因此主动/定时推送与长任务收尾不再受 token 时效限制。
+  if (contextToken) {
+    const r1 = await wxPost('ilink/bot/sendmessage', { ...base, msg: { ...base.msg, context_token: contextToken } }, token);
+    const c1 = r1 && (r1.errcode ?? r1.ret);
+    if (typeof c1 !== 'number' || c1 === 0) return;
+    log(`context_token 失效(ret=${c1})，改用无 token 发送`);
+  }
+  const r2 = await wxPost('ilink/bot/sendmessage', base, token);
+  const c2 = r2 && (r2.errcode ?? r2.ret);
+  if (typeof c2 === 'number' && c2 !== 0) {
+    throw new Error(`iLink sendmessage ret=${c2} ${r2?.errmsg ?? ''}`.trim());
   }
 }
 
@@ -862,17 +864,25 @@ async function sendMediaFile(peerId, contextToken, filePath) {
     item = { type: 4, file_item: { media, file_name: path.basename(filePath), md5: md5Hex(plaintext), len: String(plaintext.length) } };
   }
   const clientId = `openclaw-weixin-${Math.floor(Math.random() * 0xFFFFFFFF).toString(16).padStart(8, '0')}`;
-  const sendResp = await wxPost('ilink/bot/sendmessage', {
+  const smBase = {
     msg: {
       from_user_id: '', to_user_id: peerId, client_id: clientId,
-      message_type: 2, message_state: 2, context_token: contextToken,
+      message_type: 2, message_state: 2,
       item_list: [item],
     },
     base_info: { channel_version: '1.0.2' },
-  }, token);
-  const code = sendResp && (sendResp.errcode ?? sendResp.ret);
-  if (typeof code === 'number' && code !== 0) {
-    throw new Error(`iLink sendmessage ret=${code} ${sendResp?.errmsg ?? ''}`.trim());
+  };
+  // 与 sendText 一致：带 context_token 失败（token 过期 ret=-2）时 fallback 不带 token 发送
+  if (contextToken) {
+    const r1 = await wxPost('ilink/bot/sendmessage', { ...smBase, msg: { ...smBase.msg, context_token: contextToken } }, token);
+    const c1 = r1 && (r1.errcode ?? r1.ret);
+    if (typeof c1 === 'number' && c1 !== 0) log(`媒体 context_token 失效(ret=${c1})，改用无 token 发送`);
+    else { log(`媒体已发送 [${peerId}]: ${kind} ${path.basename(filePath)} (${Math.round(plaintext.length / 1024)}KB)`); return true; }
+  }
+  const r2 = await wxPost('ilink/bot/sendmessage', smBase, token);
+  const c2 = r2 && (r2.errcode ?? r2.ret);
+  if (typeof c2 === 'number' && c2 !== 0) {
+    throw new Error(`iLink sendmessage ret=${c2} ${r2?.errmsg ?? ''}`.trim());
   }
   log(`媒体已发送 [${peerId}]: ${kind} ${path.basename(filePath)} (${Math.round(plaintext.length / 1024)}KB)`);
   return true;
