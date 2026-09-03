@@ -1665,4 +1665,13 @@ server.listen(PORT, HOST, () => {
   log(`DSH: ${config.dsh.url}  |  微信已绑定: ${!!token}`);
   botLoop();              // 后台跑微信长轮询
   watchForeignReplies();  // 后台监听绑定会话（网页端发起的对话）回复并同步推送微信
+  // 定期自动补发：待补发队列不只等用户发消息触发，每 10 分钟尝试一次——
+  // 定时/主动发送若遇会话失活失败，会话一恢复（无需用户发消息）即自动补上。
+  setInterval(async () => {
+    if (sendRateLimited()) return; // 冷却期跳过，避免空打请求
+    for (const [peerId, ctx] of [...peerTokens]) {
+      try { await flushPendingReplies(peerId, ctx); }
+      catch { /* 单条失败已在 flush 内部保留待下次 */ }
+    }
+  }, 10 * 60 * 1000).unref();
 });
