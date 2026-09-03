@@ -346,8 +346,29 @@ async function ackText(sessionId, withContext) {
   return label ? `✅ 已收到，开始处理。当前对话：${label}` : '✅ 已收到，开始处理…';
 }
 
+// ---- 全局 iLink 发送风控自动冷却 ----
+// 连续多次 prepare failed（ret=-2）说明 iLink 正在风控；此时若继续高频打请求只会加重风控。
+// 触发冷却后，冷却期内所有发送请求直接跳过（不请求），避免恶化；冷却结束后自动恢复并补发。
+const RATE_LIMIT_COOLDOWN_MS = 3 * 60 * 1000;
+let rateLimitUntil = 0;
+let rateLimitStreak = 0;
+function noteSendFailure(err) {
+  if (err && /prepare failed|ret=-2/.test(String(err.message ?? ''))) {
+    rateLimitStreak++;
+    if (rateLimitStreak >= 3) {
+      rateLimitUntil = Date.now() + RATE_LIMIT_COOLDOWN_MS;
+      log(`检测到 iLink 发送风控（连续 ${rateLimitStreak} 次失败），暂停发送 ${RATE_LIMIT_COOLDOWN_MS / 60000} 分钟，到期自动恢复`);
+      rateLimitStreak = 0;
+    }
+  } else {
+    rateLimitStreak = 0;
+  }
+}
+function sendRateLimited() { return Date.now() < rateLimitUntil; }
+
 // 发送带超时与自动重试（针对“结果没发回微信”的兜底）
 async function sendTextWithRetry(peerId, contextToken, text, tries = 2) {
+  if (sendRateLimited()) throw new Error('iLink 发送风控冷却中，稍后自动重试'); // 冷却期不发请求，避免加重
   let lastErr;
   for (let i = 0; i < tries; i++) {
     try {
@@ -359,6 +380,7 @@ async function sendTextWithRetry(peerId, contextToken, text, tries = 2) {
     } catch (e) {
       lastErr = e;
       log(`发送消息重试 ${i + 1}/${tries}: ${e.message}`);
+      noteSendFailure(e); // 连续 prepare failed → 触发全局冷却
       await sleep(2000);
     }
   }
@@ -1417,9 +1439,9 @@ async function watchForeignReplies() {
 // 反而加重发送风控（prepare failed）并刷屏日志。改为 5 分钟一次低频重试，帮助风控恢复；
 // 不丢消息：失败文本已入待补发队列，凭证/风控恢复后自动补发。
 const SYNC_RETRY_MS = 5 * 60 * 1000;
-// 同步推送节流：网页端任务阶段回复每 15 秒最多推 1 条（避免高频触发 iLink 风控，节奏更及时）；
+// 同步推送节流：网页端任务阶段回复每 30 秒最多推 1 条（避免高频触发 iLink 风控，节奏更及时）；
 // turn/end 时最新未推文本会补推（最终必达），中间被节流的不会丢最终。
-const PUSH_THROTTLE_MS = 15_000;
+const PUSH_THROTTLE_MS = 30_000;
 async function syncPush(text, st) {
   if (st.lastFailAt && Date.now() - st.lastFailAt < SYNC_RETRY_MS) return false; // 冷却中
   const peerId = lastActivePeer;
