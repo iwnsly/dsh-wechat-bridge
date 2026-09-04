@@ -433,22 +433,27 @@ async function flushPendingReplies(peerId, contextToken, sessionId = resolveSess
   // 命中当前会话的积压；sessionId 为 null 的条目是外部主动消息，可随任意会话一起补发。
   const matched = arr.filter((entry) => entry.sessionId === sessionId || entry.sessionId == null);
   if (!matched.length) return;
-  const last = matched[matched.length - 1]; // 只补发其中最后一条（最新/最终结果），不刷屏
   // 只清掉本次命中的旧条目（同会话或主动消息的历史积压），只保留其它会话的待补发。
   const remaining = arr.filter((entry) => !matched.includes(entry));
   if (remaining.length) pendingReplies.set(peerId, remaining);
   else pendingReplies.delete(peerId);
   saveState();
-  // context_token 可为空：sendText 内部会自动尝试无 token 发送，适合定时任务场景。
-  try {
-    await sendTextWithRetry(peerId, contextToken, `（补发）${last.text}`);
-    log(`补发成功 [${peerId}] 会话=${last.sessionId?.slice(0, 12) ?? '主动'}: ${last.text.slice(0, 40)}${last.text.length > 40 ? '…' : ''}`);
-  } catch (e) {
-    const restored = pendingReplies.get(peerId) ?? [];
-    restored.push(last); // 失败保留，等下次发消息或定时补发
-    pendingReplies.set(peerId, restored);
-    saveState();
-    log('补发失败（保留待下次）:', e.message);
+  // 按实际发送顺序（入队顺序=产生顺序，旧→新）逐条补发；
+  // 任一条失败则把"该条及其后的剩余"放回队列，保持顺序，等下次继续。
+  const order = matched;
+  for (let i = 0; i < order.length; i++) {
+    const entry = order[i];
+    try {
+      await sendTextWithRetry(peerId, contextToken, `（补发）${entry.text}`);
+      log(`补发成功 [${peerId}] 会话=${entry.sessionId?.slice(0, 12) ?? '主动'}: ${entry.text.slice(0, 40)}${entry.text.length > 40 ? '…' : ''}`);
+    } catch (e) {
+      const tail = order.slice(i); // 从失败这条起（含）保留，顺序不变
+      const restored = pendingReplies.get(peerId) ?? [];
+      pendingReplies.set(peerId, [...restored, ...tail]);
+      saveState();
+      log('补发中断（保留剩余待下次）:', e.message);
+      break;
+    }
   }
 }
 
