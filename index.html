@@ -59,6 +59,7 @@
       <h2>DeepSeek Harness</h2>
       <div class="big"><span class="dot" id="dsh-dot"></span><span id="dsh-text">检测中…</span></div>
       <div class="meta" id="dsh-url"></div>
+      <button id="btn-dsh-reconnect" style="margin-top:8px">重新连接 DSH</button>
     </div>
     <div class="card">
       <h2>控制服务</h2>
@@ -265,6 +266,19 @@ async function refresh() {
 }
 
 $('btn-refresh-sessions').onclick = () => refreshSessions();
+$('btn-dsh-reconnect').onclick = async () => {
+  const btn = $('btn-dsh-reconnect');
+  btn.disabled = true;
+  btn.textContent = '重连中…';
+  try {
+    const r = await postJson('/api/dsh-reconnect');
+    await refresh();
+    alert(r?.ok ? '✅ DSH 已重新连接' : '❌ 重连失败：' + (r?.dsh?.error ?? JSON.stringify(r)));
+  } finally {
+    btn.disabled = false;
+    btn.textContent = '重新连接 DSH';
+  }
+};
 $('btn-bind').onclick = async () => { await postJson('/api/bind'); refresh(); };
 $('btn-unbind').onclick = async () => {
   if (!confirm('确定解绑当前微信？')) return;

@@ -180,12 +180,25 @@ async function dshRpc(method, payload, timeoutMs = 60_000) {
     args = { request: { requestId: randomUUID(), ...(payload ?? {}) } };
   }
   const rpcId = randomUUID();
-  const res = await fetch(`${config.dsh.url}/api/${m}`, {
+  const bodyStr = JSON.stringify({ type: 'client-request', rpcId, method: m, payload: { args } });
+  let res = await fetch(`${config.dsh.url}/api/${m}`, {
     method: 'POST',
     headers: { 'content-type': 'application/json', Cookie: dshAuthHeader() },
-    body: JSON.stringify({ type: 'client-request', rpcId, method: m, payload: { args } }),
+    body: bodyStr,
     signal: AbortSignal.timeout(timeoutMs),
   });
+  // 401（DSH 重启/secret 变更导致 Cookie 失效）：清缓存重建后重试一次（自愈）
+  if (res.status === 401 && dshAuthCookie) {
+    dshAuthCookie = null;
+    dshAuthCookieUntil = 0;
+    log('DSH 认证失效(401)，重新生成认证 Cookie 并重试');
+    res = await fetch(`${config.dsh.url}/api/${m}`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', Cookie: dshAuthHeader() },
+      body: bodyStr,
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+  }
   if (!res.ok) throw new Error(`DSH ${method}: HTTP ${res.status}`);
   const full = await res.json();
   if (full?.type !== 'server-response' || full.rpcId !== rpcId) throw new Error(`DSH ${method}: 意外响应`);
@@ -1824,6 +1837,16 @@ const server = http.createServer(async (req, res) => {
   if (req.method === 'GET' && pathname === '/api/logs') {
     const since = Number(url.searchParams.get('since') ?? 0);
     return json(res, 200, { ok: true, logs: ring.filter((l) => l.t > since) });
+  }
+
+  // POST /api/dsh-reconnect —— 手动重新连接 DSH：重建认证 Cookie + 刷新 workspace 快照
+  if (req.method === 'POST' && pathname === '/api/dsh-reconnect') {
+    dshAuthCookie = null;
+    dshAuthCookieUntil = 0;
+    asOfCache.clear();
+    await refreshWorkspaceSnapshot();
+    const dsh = await dshStatus();
+    return json(res, 200, { ok: dsh.ok, dsh, snapshot: !!workspaceSnapshot });
   }
 
   // POST /api/send  { text: '...', peerId?: 'o9cq...' }

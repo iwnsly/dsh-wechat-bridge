@@ -115,6 +115,7 @@ npm start                 # 等价 node control.mjs
 | `GET /api/logs` | 最近日志（网页「最近日志」面板） |
 | `POST /api/send` | 主动给微信发文本消息（外部系统/定时任务触发） |
 | `POST /api/send-file` | 主动把本地文件/图片发到微信（外部系统/定时任务触发） |
+| `POST /api/dsh-reconnect` | 重新连接 DSH：重建认证 Cookie + 刷新 workspace 快照（界面「重新连接 DSH」按钮；DSH 重启/secret 变更后用于手动恢复） |
 
 ### `/api/send` 主动发送接口
 
