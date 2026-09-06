@@ -128,6 +128,37 @@ async function latestSessionSeq(sessionId) {
   if (seq) asOfCache.set(sessionId, { seq, at: Date.now() });
   return seq;
 }
+// ---- workspace/follow 快照（WebSocket MUX 读 baseline：工作区列表 + 归档会话集合）----
+// DSH 新版无 workspace.list，改为 workspace/follow 流；其首帧 baseline 即完整快照。
+let workspaceSnapshot = null; // { items:[{workspaceId,title,sessionIds}], archivedSessionIds:[], at }
+let wsRefreshing = false;
+const WS_MUX_TIMEOUT_MS = 8000;
+function refreshWorkspaceSnapshot() {
+  if (wsRefreshing) return Promise.resolve();
+  wsRefreshing = true;
+  return new Promise((resolve) => {
+    let done = false;
+    const finish = () => { if (!done) { done = true; wsRefreshing = false; resolve(); } };
+    let ws;
+    const timer = setTimeout(() => { try { ws?.close(); } catch {} finish(); }, WS_MUX_TIMEOUT_MS);
+    try {
+      const muxUrl = config.dsh.url.replace(/^http/, 'ws') + '/api/remote.mux';
+      ws = new WebSocket(muxUrl, { headers: { Cookie: dshAuthHeader() } });
+    } catch (e) { clearTimeout(timer); finish(); return; }
+    const streamId = randomUUID();
+    ws.onopen = () => { try { ws.send(JSON.stringify({ type: 'open', streamId, endpoint: 'workspace/follow', payload: { args: {} } })); } catch {} };
+    ws.onmessage = (e) => {
+      let m; try { m = JSON.parse(String(e.data)); } catch { return; }
+      if (m.type === 'item' && m.value?.type === 'baseline') {
+        const b = m.value.value ?? {};
+        workspaceSnapshot = { items: b.items ?? [], archivedSessionIds: b.archivedSessionIds ?? [], at: Date.now() };
+        try { ws.send(JSON.stringify({ type: 'cancel', streamId })); } catch {}
+      } else if (m.type === 'end') { try { ws.close(); } catch {} }
+    };
+    ws.onclose = () => { clearTimeout(timer); finish(); };
+    ws.onerror = () => { try { ws.close(); } catch {} };
+  });
+}
 async function dshRpc(method, payload, timeoutMs = 60_000) {
   let endpoint = method.replace(/\./g, '/');
   let wire = DSH_WIRE_BY_ENDPOINT[endpoint] ?? 'request';
@@ -178,15 +209,17 @@ async function listSessions() {
   // 2. 空白会话（无任何对话内容）不显示、不可选
   // 3. 子任务会话（parentSessionId 非空）不显示——它们是某会话派生的子任务，不出现在工作区/界面
   // 4. 只显示归属于某个工作区（workspace.sessionIds）的会话，与界面左侧列表一致；
-  //    新版 DSH 无 workspace.list（改用 follow 流），拿不到时退化为不过滤（仅按归档/空白/子任务过滤）。
+  //    快照来自 workspace/follow（WebSocket baseline）；不可用时退化为不过滤（仅按归档/空白/子任务过滤）。
+  const snap = workspaceSnapshot;
   let archived = new Set();
   let inWorkspace = null;
-  try {
-    const wl = await dshRpc('workspace.list', {}, 15_000);
-    archived = new Set(wl.archivedSessionIds ?? []);
+  if (snap) {
+    archived = new Set(snap.archivedSessionIds ?? []);
     inWorkspace = new Set();
-    for (const w of wl.items ?? []) for (const sid of w.sessionIds ?? []) inWorkspace.add(sid);
-  } catch { /* workspace 信息不可用：降级 */ }
+    for (const w of snap.items ?? []) for (const sid of w.sessionIds ?? []) inWorkspace.add(sid);
+  }
+  // 快照缺失或过期（>5 分钟）→ 后台异步刷新（本次先用旧值，避免阻塞）
+  if (!snap || Date.now() - snap.at > 5 * 60 * 1000) void refreshWorkspaceSnapshot();
   return items
     .filter((s) => !archived.has(s.sessionId))
     .filter((s) => !s.blank)
@@ -426,11 +459,10 @@ async function promptWithStatus(peerId, contextToken, sessionId, text, isCancell
 async function sessionContextLabel(sessionId) {
   if (!sessionId) return '';
   try {
-    const [wl, sl] = await Promise.all([
-      dshRpc('workspace.list', {}, 15_000).catch(() => null),
-      dshRpc('session.list', {}, 15_000).catch(() => null),
-    ]);
-    const wsTitle = (wl?.items ?? []).find((w) => (w.sessionIds ?? []).includes(sessionId))?.title;
+    // 工作区信息来自 workspace/follow 快照（新版无 workspace.list）
+    const snap = workspaceSnapshot;
+    const sl = await dshRpc('session.list', {}, 15_000).catch(() => null);
+    const wsTitle = (snap?.items ?? []).find((w) => (w.sessionIds ?? []).includes(sessionId))?.title;
     const ses = (sl?.items ?? []).find((x) => x.sessionId === sessionId);
     const sTitle = ses?.projections?.values?.title ?? ses?.title ?? '';
     const name = sTitle && sTitle.trim() ? sTitle : sessionId.slice(0, 12);
@@ -878,8 +910,11 @@ async function applySwitchChoice(peerId, contextToken, n) {
 
 // ---- 微信命令：选择工作区并新建会话 ----
 async function listWorkspaces() {
-  const v = await dshRpc('workspace.list', {}, 15_000);
-  const items = v.items ?? [];
+  // 新版无 workspace.list：用 workspace/follow 快照（无快照时尝试刷新）
+  let snap = workspaceSnapshot;
+  if (!snap) { await refreshWorkspaceSnapshot(); snap = workspaceSnapshot; }
+  const items = snap?.items ?? [];
+  if (!items.length) throw new Error('暂无工作区信息（workspace 快照不可用）');
   return items.map((w) => ({
     workspaceId: w.workspaceId,
     title: (w.title && w.title.trim()) ? w.title : w.path,
@@ -1857,6 +1892,7 @@ server.listen(PORT, HOST, () => {
   log(`DSH: ${config.dsh.url}  |  微信已绑定: ${!!token}`);
   botLoop();              // 后台跑微信长轮询
   watchForeignReplies();  // 后台监听绑定会话（网页端发起的对话）回复并同步推送微信
+  refreshWorkspaceSnapshot(); // 启动即拉取 workspace/follow 快照（工作区/归档，供切换清单过滤）
   // 定期自动补发：待补发队列不只等用户发消息触发，每 10 分钟尝试一次——
   // 定时/主动发送若遇会话失活失败，会话一恢复（无需用户发消息）即自动补上。
   setInterval(async () => {
