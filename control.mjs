@@ -5,7 +5,7 @@ import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { randomUUID, createDecipheriv, createCipheriv, createHash, randomBytes } from 'node:crypto';
+import { randomUUID, createDecipheriv, createCipheriv, createHash, createHmac, randomBytes } from 'node:crypto';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const WX_BASE = 'https://ilinkai.weixin.qq.com';
@@ -76,19 +76,92 @@ function saveState() {
 }
 
 // ---------------- DSH 客户端 ----------------
+// DSH 新版（2026-09 升级）适配要点：
+// 1) web API 需认证：浏览器会话 Cookie（HMAC-SHA256 签名，密钥来自 ~/.dsh/.credentials.yaml 的 browser-session secret）
+// 2) RPC 端点由 /api/session.list 改为 /api/session/list（点号→斜杠），body.method 须与端点一致
+// 3) payload 需包 args：{ args: { <参数wire名>: 原参数 } }（单参数方法 wire 名多为 request/_request）
+// 4) session.history 已更名 session/page：参数 { address, throughSeq, maxMessages }，返回 { records:[{type,event}] }，
+//    桥接统一映射回 { events: records }；throughSeq 取会话最新 seq（session.list 的 projections.asOfSeq）
+const DSH_SECRET_PATH = '/Users/macbot/.dsh/.credentials.yaml';
+const DSH_WIRE_BY_ENDPOINT = { 'session/list': '_request' }; // 其余方法默认 wire='request'
+let dshAuthCookie = null;
+let dshAuthCookieUntil = 0;
+function dshAuthHeader() {
+  if (dshAuthCookie && Date.now() < dshAuthCookieUntil) return dshAuthCookie;
+  try {
+    const raw = fs.readFileSync(DSH_SECRET_PATH, 'utf8');
+    let secret = null;
+    const ls = raw.split('\n');
+    for (let i = 0; i < ls.length; i++) {
+      if (/browser-session/.test(ls[i])) {
+        for (let j = i + 1; j < Math.min(i + 8, ls.length); j++) {
+          const m = ls[j].match(/^\s*secret:\s*"?([A-Za-z0-9_-]{40,})"?/);
+          if (m) { secret = m[1]; break; }
+        }
+        if (secret) break;
+      }
+    }
+    if (!secret) throw new Error('browser-session secret 未找到');
+    const b64 = (v) => { const p = '='.repeat((4 - v.length % 4) % 4); return Buffer.from(v.replaceAll('-', '+').replaceAll('_', '/') + p, 'base64'); };
+    const sec = b64(secret);
+    const authority = new URL(config.dsh.url).host;
+    const name = 'dsh-auth-' + createHash('sha256').update(authority).digest('base64').replaceAll('+', '-').replaceAll('/', '_').replace(/=+$/g, '');
+    const now = Date.now();
+    const body = Buffer.from(JSON.stringify({ version: 1, authority, issuedAt: now, expiresAt: now + 7 * 86400e3 })).toString('base64').replaceAll('+', '-').replaceAll('/', '_').replace(/=+$/g, '');
+    const sig = createHmac('sha256', sec).update(body).digest('base64').replaceAll('+', '-').replaceAll('/', '_').replace(/=+$/g, '');
+    dshAuthCookie = `${name}=v1.${body}.${sig}`;
+    dshAuthCookieUntil = now + 6 * 86400e3; // 提前 1 天重造
+    return dshAuthCookie;
+  } catch (e) {
+    log('生成 DSH 认证 Cookie 失败:', e.message);
+    return '';
+  }
+}
+// 会话最新 seq（session.list 的 projections.asOfSeq）；短缓存避免每轮多调
+const asOfCache = new Map(); // sessionId -> { seq, at }
+async function latestSessionSeq(sessionId) {
+  const c = asOfCache.get(sessionId);
+  if (c && Date.now() - c.at < 400) return c.seq;
+  const { items } = await dshRpc('session.list', {}, 8000);
+  const it = (items ?? []).find((x) => x.sessionId === sessionId);
+  const seq = Number(it?.projections?.asOfSeq ?? 0);
+  if (seq) asOfCache.set(sessionId, { seq, at: Date.now() });
+  return seq;
+}
 async function dshRpc(method, payload, timeoutMs = 60_000) {
+  let endpoint = method.replace(/\./g, '/');
+  let wire = DSH_WIRE_BY_ENDPOINT[endpoint] ?? 'request';
+  let args = { [wire]: payload ?? {} };
+  let m = endpoint;
+  if (method === 'session.history') {
+    // 兼容旧调用：映射到 session/page
+    m = 'session/page';
+    wire = 'request';
+    let throughSeq = payload?.throughSeq;
+    if (!throughSeq) throughSeq = await latestSessionSeq(payload?.sessionId);
+    args = { request: {
+      address: { kind: 'session', sessionId: payload?.sessionId },
+      throughSeq: throughSeq || 0,
+      ...(payload?.maxMessages ? { maxMessages: payload.maxMessages } : {}),
+    } };
+  } else if (method === 'session.prompt') {
+    // 新版 prompt 必填 requestId
+    args = { request: { requestId: randomUUID(), ...(payload ?? {}) } };
+  }
   const rpcId = randomUUID();
-  const res = await fetch(`${config.dsh.url}/api/${method}`, {
+  const res = await fetch(`${config.dsh.url}/api/${m}`, {
     method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ type: 'client-request', rpcId, method, payload }),
+    headers: { 'content-type': 'application/json', Cookie: dshAuthHeader() },
+    body: JSON.stringify({ type: 'client-request', rpcId, method: m, payload: { args } }),
     signal: AbortSignal.timeout(timeoutMs),
   });
   if (!res.ok) throw new Error(`DSH ${method}: HTTP ${res.status}`);
   const full = await res.json();
   if (full?.type !== 'server-response' || full.rpcId !== rpcId) throw new Error(`DSH ${method}: 意外响应`);
   if (!full.result.ok) throw new Error(`DSH ${method} 业务错误: ${JSON.stringify(full.result.error)}`);
-  return full.result.value;
+  let value = full.result.value;
+  if (method === 'session.history') value = { events: value?.records ?? [] }; // records→events 兼容
+  return value;
 }
 async function dshStatus() {
   try {
@@ -104,19 +177,21 @@ async function listSessions() {
   // 1. 已归档（删除/隐藏）的会话不显示
   // 2. 空白会话（无任何对话内容）不显示、不可选
   // 3. 子任务会话（parentSessionId 非空）不显示——它们是某会话派生的子任务，不出现在工作区/界面
-  // 4. 只显示归属于某个工作区（workspace.sessionIds）的会话，与界面左侧列表一致
+  // 4. 只显示归属于某个工作区（workspace.sessionIds）的会话，与界面左侧列表一致；
+  //    新版 DSH 无 workspace.list（改用 follow 流），拿不到时退化为不过滤（仅按归档/空白/子任务过滤）。
   let archived = new Set();
-  let inWorkspace = new Set();
+  let inWorkspace = null;
   try {
     const wl = await dshRpc('workspace.list', {}, 15_000);
     archived = new Set(wl.archivedSessionIds ?? []);
+    inWorkspace = new Set();
     for (const w of wl.items ?? []) for (const sid of w.sessionIds ?? []) inWorkspace.add(sid);
-  } catch {}
+  } catch { /* workspace 信息不可用：降级 */ }
   return items
     .filter((s) => !archived.has(s.sessionId))
     .filter((s) => !s.blank)
     .filter((s) => !s.parentSessionId)
-    .filter((s) => inWorkspace.has(s.sessionId))
+    .filter((s) => inWorkspace === null || inWorkspace.has(s.sessionId))
     .map((s) => ({
     sessionId: s.sessionId,
     title: s.projections?.values?.title ?? null,

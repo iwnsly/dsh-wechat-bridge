@@ -42,6 +42,7 @@ wechat-bridge/
 - Node.js ≥ 18（本机已装 v24）。
 - 微信 App 已支持「ClawBot」插件（官方推送，部分版本/地区灰度）。
 - DeepSeek Harness Web 正在运行（`http://127.0.0.1:3080`）。
+- **DSH 新版（2026-09+）默认启用 web 认证**：桥接会自动读取 `~/.dsh/.credentials.yaml` 的 `browser-session` secret 生成签名 Cookie 访问 API，无需手动配置；若该文件缺失/格式变化，日志会提示「生成 DSH 认证 Cookie 失败」。
 
 ## 快速开始
 
